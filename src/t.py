@@ -31,12 +31,12 @@ class GRUCell:
 
         if is_prediction:
             # Increase effort during prediction
-            self.effort += z
+            self.effort += np.mean(z)
         else:
             # Decrease effort during execution
-            self.effort -= z
+            self.effort = max(0, self.effort - np.mean(1 - z))
 
-        return self.h, self.effort
+        return self.h, z
 
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
@@ -53,40 +53,45 @@ class RLGRUModel:
         self.W_reward = np.random.randn(1, hidden_size) / np.sqrt(hidden_size)
         self.b_reward = np.zeros((1, 1))
         self.learning_rate = learning_rate
+        self.n_step_ahead = n_step_ahead
 
     def predict(self, state, is_prediction=False):
-        h, effort = self.gru.forward(state, is_prediction)
+        h, z = self.gru.forward(state, is_prediction)
         action_probs = self.softmax(np.dot(self.W_action, h) + self.b_action)
         predicted_reward = np.dot(self.W_reward, h) + self.b_reward
         return action_probs, predicted_reward, self.gru.effort
 
-    def predict(self, state, step_radius, value_threshold):
-        paths = []
-        if step_radius == 0:
-            return paths
-        h, effort = self.gru.forward(state, True)
-        action_probs = self.softmax(np.dot(self.W_action, h) + self.b_action)
-        
-        paths.append(self.predict(next_state, step_radius - 1, value_threshold))
-        return paths
+    def predict_n_step(self, initial_state):
+        state = initial_state
+        predictions = []
+        for _ in range(self.n_step_ahead):
+            action_probs, predicted_reward, effort = self.predict(state, is_prediction=True)
+            predictions.append((action_probs, predicted_reward, effort))
+            # For simplicity, we'll use the most probable action as the next state
+            # In a real scenario, you might want to use the environment model here
+            next_state = np.argmax(action_probs)
+            state = self.preprocess_state(next_state)
+        return predictions
 
-
-    def calculate_re_value(self, reward, effort):
-        return  reward / (1 + effort)
+    def calculate_re_value(self, predictions):
+        re_value = 0
+        for t, (_, reward, effort) in enumerate(predictions):
+            re_value += reward / (1 + effort * t)
+        return re_value
 
     def softmax(self, x):
         exp_x = np.exp(x - np.max(x))
         return exp_x / np.sum(exp_x)
 
     def train_step(self, state, action, reward, next_state, done):
-        # Forward pass
-        action_probs, predicted_reward, effort = self.predict(state)
+        # Forward pass (execution)
+        action_probs, predicted_reward, effort = self.predict(state, is_prediction=False)
         
         # Compute n-step ahead predictions
         future_predictions = self.predict_n_step(next_state)
         
         # Calculate RE_value
-        re_value = self.calculate_re_value([(action_probs, predicted_reward, z)] + future_predictions)
+        re_value = self.calculate_re_value([(action_probs, predicted_reward, effort)] + future_predictions)
 
         # Compute loss (you may want to adjust this based on your specific requirements)
         action_loss = -np.log(action_probs[action]) * (reward - predicted_reward)
@@ -109,7 +114,7 @@ class RLGRUModel:
         self.W_reward -= self.learning_rate * dL_dW_reward
         self.b_reward -= self.learning_rate * dL_db_reward
 
-        return total_loss
+        return total_loss, effort
 
     def preprocess_state(self, state):
         # This function should be adapted based on the specific MiniGrid environment
@@ -131,20 +136,22 @@ for episode in range(num_episodes):
     state = model.preprocess_state(state['image'])
     done = False
     total_reward = 0
+    episode_efforts = []
     
     while not done:
-        action_probs, _, _ = model.predict(state)
+        action_probs, _, _ = model.predict(state, is_prediction=False)
         action = np.random.choice(action_size, p=action_probs.flatten())
         
         next_state, reward, done, _, _ = env.step(action)
         next_state = model.preprocess_state(next_state['image'])
         
-        loss = model.train_step(state, action, reward, next_state, done)
+        loss, effort = model.train_step(state, action, reward, next_state, done)
         
         state = next_state
         total_reward += reward
+        episode_efforts.append(effort)
     
     if episode % 10 == 0:
-        print(f"Episode {episode}, Total Reward: {total_reward}, Loss: {loss}")
+        print(f"Episode {episode}, Total Reward: {total_reward}, Loss: {loss}, Avg Effort: {np.mean(episode_efforts)}")
 
 print("Training completed!")

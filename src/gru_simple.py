@@ -1,5 +1,8 @@
 import numpy as np
 from environment import Environment
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 rewards = [
@@ -9,94 +12,146 @@ rewards = [
 ]
 
 
-
 grid_size = len(rewards)
 env = Environment(rewards)
 env.set_exit(grid_size - 1, grid_size - 1)
 
-class GRUCell:
-    def __init__(self, input_size, hidden_size):
+# PL is a GRU that integrate goal information G(t), 
+# context from the hippocampus C(t), 
+# and feedback from the ACC (E(t), F(t)) to dynamically update 
+# its task set representations T_i.
+
+# Interaction with Hippocampus:
+#       - Bidirectional connections with ventral CA1 and subiculum create a loop for continuous goal-context integration
+#       - PL-to-CA1 projections modulate sharp-wave ripple events, influencing replay content
+
+
+# ACC modeled as a separate GRU,
+# taking in P(t), O(t), and computing Error signal: E(t),  conflict signal: F(t).
+# E(t) = ||P(t) - O(t)||^2 + λ * ||∇h_t||^2  # Error signal computation
+# F(t) = g(h_t)                          # Conflict signal computation
+
+# Interaction with Hippocampus:
+#       - Receives place cell input from dorsal CA1, allowing alignment of effort coding with specific spatial locations
+#       - ACC-to-CA1 feedback influences the rate of theta sequences, potentially scaling mental exploration speed based on effort
+
+
+class ACC(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1):
+        super(ACC, self).__init__()
         self.hidden_size = hidden_size
-
-        self.W_h = np.random.randn(hidden_size, input_size) / np.sqrt(input_size)  # PL transition probablilities (Rules)
-        self.W_z = np.random.randn(hidden_size, input_size) / np.sqrt(input_size)  # ACC Effort estimation
-        self.W_r = np.random.randn(hidden_size, input_size) / np.sqrt(input_size)  # IL Behavioral extinction
+        self.num_layers = num_layers
         
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        
+        # Parameters for various computations
+        self.effort_discount = nn.Parameter(torch.tensor(0.1))
+        self.volatility_lr = nn.Parameter(torch.tensor(0.1))
+        self.gamma = nn.Parameter(torch.tensor(0.9))  # Discount factor for EVC
+        self.theta_0 = nn.Parameter(torch.tensor(0.9))  # For learning rate update
+        self.theta_j = nn.Parameter(torch.tensor(0.1))  # For learning rate update
+        
+    def forward(self, predicted_outcomes, observed_outcomes, effort_level, previous_control_signals, hidden_state=None):
+        if hidden_state is None:
+            hidden_state = self.init_hidden(predicted_outcomes.size(0))
+        
+        # 1. Reward Prediction Error (RPE)
+        rpe = observed_outcomes - predicted_outcomes
+        
+        # 2. Expected Value of Control (EVC)
+        immediate_reward = observed_outcomes
+        future_evc = self.gamma * torch.max(previous_control_signals, dim=-1)[0]
+        evc = immediate_reward + future_evc - self.effort_discount * effort_level
+        
+        # 3. Conflict Monitoring
+        conflict = -torch.sum(predicted_outcomes * predicted_outcomes, dim=-1, keepdim=True)
+        
+        # 4. Surprise
+        epsilon = 1e-10  # To avoid log(0)
+        surprise = -torch.log2(predicted_outcomes + epsilon)
+        
+        # 5. Volatility Estimation
+        volatility = self.volatility_lr * rpe
+        
+        # 6. Effort Discounting (already used in EVC calculation)
+        subjective_value = observed_outcomes * (1 - self.effort_discount * effort_level)
+        
+        # 7. Cost-Benefit Ratio
+        cbr = observed_outcomes / (effort_level + epsilon)
+        
+        # 8. Error-Related Negativity (ERN)
+        ern = torch.mean(torch.abs(rpe), dim=-1, keepdim=True)
+        
+        # 9. Learning Rate Update
+        prev_learning_rate = self.volatility_lr
+        new_learning_rate = self.theta_0 * prev_learning_rate + self.theta_j * torch.abs(rpe.mean())
+        self.volatility_lr.data = torch.clamp(new_learning_rate, min=0.01, max=1.0)
+        
+        # Combine all signals for GRU processing
+        combined_signals = torch.cat([
+            rpe, evc, conflict, surprise, volatility, subjective_value, cbr, ern
+        ], dim=-1)
+        
+        # Process through GRU to maintain state
+        out, hidden = self.gru(combined_signals, hidden_state)
+        
+        return {
+            'rpe': rpe,
+            'evc': evc,
+            'conflict': conflict,
+            'surprise': surprise,
+            'volatility': volatility,
+            'subjective_value': subjective_value,
+            'cbr': cbr,
+            'ern': ern,
+            'learning_rate': self.volatility_lr.item(),
+            'hidden': hidden
+        }
+    
+    def init_hidden(self, batch_size):
+        return torch.zeros(self.num_layers, batch_size, self.hidden_size, device=next(self.parameters()).device)
+
+class PrelimbicCortex(nn.Module):
+    def __init__(self, goal_input_size, action_output_size, hidden_size, num_layers=1):
+        super(PrelimbicCortex, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.goal_gru = nn.GRU(goal_input_size, hidden_size, num_layers, batch_first=True)
+        self.action_fc = nn.Linear(hidden_size, action_output_size)
+        
+        self.update_gate = nn.Linear(hidden_size + 5, hidden_size)  # +5 for error and conflict signals
+        self.reset_gate = nn.Linear(hidden_size + 5, hidden_size)
+        self.candidate_state = nn.Linear(hidden_size + 5, hidden_size)
+        
+    def forward(self, goal_inputs, acc_error, acc_conflict, hidden_state=None):
+        if hidden_state is None:
+            hidden_state = self.init_hidden(goal_inputs.size(0))
+        
+        # Process the goal inputs using the GRU
+        goal_outputs, hidden = self.goal_gru(goal_inputs, hidden_state)
+        goal_representation = goal_outputs[:, -1, :]
+        
+        # Combine ACC inputs
+        acc_inputs = torch.cat((acc_error, acc_conflict), dim=-1)
+        
+        # Use the ACC inputs to control the update of the hidden state
+        combined = torch.cat((hidden[-1], acc_inputs), dim=-1)
+        update_gate = torch.sigmoid(self.update_gate(combined))
+        reset_gate = torch.sigmoid(self.reset_gate(combined))
+        candidate_state = torch.tanh(self.candidate_state(torch.cat((reset_gate * hidden[-1], acc_inputs), dim=-1)))
+        new_hidden = update_gate * hidden[-1] + (1 - update_gate) * candidate_state
+        
+        # Compute the action hierarchy prediction
+        action_hierarchy = self.action_fc(new_hidden)
+        
+        return action_hierarchy, new_hidden.unsqueeze(0)
+    
+    def init_hidden(self, batch_size):
+        return torch.zeros(self.num_layers, batch_size, self.hidden_size, device=next(self.parameters()).device)
 
 
-        self.U_h = np.random.randn(hidden_size, hidden_size) / np.sqrt(hidden_size)
-        self.U_z = np.random.randn(hidden_size, hidden_size) / np.sqrt(hidden_size)
-        self.U_r = np.random.randn(hidden_size, hidden_size) / np.sqrt(hidden_size)
 
-        self.b_h = np.zeros((hidden_size, 1))
-        self.b_z = np.zeros((hidden_size, 1))
-        self.b_r = np.zeros((hidden_size, 1))
-
-
-        self.h = np.zeros((hidden_size, 1))
-        self.predicted_h = np.zeros((hidden_size, 1))
-
-        self.predicted_state = np.zeros((hidden_size, 1))
-
-        # OFC Reward prediction weights based on predicted state from chosen goal state
-        self.W_R = np.random.randn(hidden_size, input_size) / np.sqrt(input_size)
-        self.U_R = np.random.randn(hidden_size, hidden_size) / np.sqrt(hidden_size) # recurrent weights
-        self.b_R = np.zeros((hidden_size, 1)) # bias weights
-
-        # efforts based on transition from current state to goal state
-        self.effort = np.zeros((hidden_size, 1))
-
-        self.positive_valence = 0
-        self.negative_valence = 0
-
-
-    # Todo: rework so that the ACC predict the outcome associated with the choice from the PL
-    # Calcualte the effort and compare it to the predicted reward to tell if 
-
-    def forward(self, x, execute=True):
-
-        # Calculate the state for the PL. this is the predicted hidden state
-        # The ACC Takes this as the action, and predicts the resulting states and gives it to the OFC to get the reward
-        # The predicted reward is  used with the calcualted effort to determine if the action/sub-actions need to be switched
-        # If predicted state does not match actual state, then the ACC will trigger a switch
-
-            x = x.reshape(-1, 1)
-
-            z = self.sigmoid(np.dot(self.W_z, x) + np.dot(self.U_z, self.h) + self.b_z)
-            r = self.sigmoid(np.dot(self.W_r, x) + np.dot(self.U_r, self.h) + self.b_r)
-            h_hat = np.tanh(np.dot(self.W_h, x) + np.dot(self.U_h, r * self.h) + self.b_h)
-
-            self.predicted_h = (1 - z) * self.h + z * h_hat # PL state
-
-            trajectory = self.sigmoid(np.dot(self.W_))
-
-            # Predict the reward for the predicted options
-            reward = self.sigmoid(np.dot(self.W_R, x) + np.dot(self.U_R, self.predicted_h) + self.b_R)
-
-            # Estimate the mental effort for next step for each possibility
-            # (mental effort is the effort to maintain the current state)
-            self.effort += z
-
-            # calculate the value of the next state based on the reward and effort
-            re_value = reward / (1 + self.effort)
-
-            # apply the value to the hidden state
-            self.predicted_h *= re_value
-
-            if execute:
-                    self.h = self.predicted_h
-                    # Recalculate the effort for the current new self.h
-                    z = self.sigmoid(np.dot(self.W_z, x) + np.dot(self.U_z, self.h) + self.b_z)
-                    self.effort -= z
-
-            return self.h
-
-    def sigmoid(self, x):
-            return 1 / (1 + np.exp(-x))
-
-    def reset_hidden_state(self):
-            self.h = np.zeros((self.hidden_size, 1))
-            self.effort = 0
 
 class RLGRUModel:
     def __init__(self, input_size, hidden_size, action_size, learning_rate=0.001):
@@ -122,6 +177,15 @@ class RLGRUModel:
             return exp_x / np.sum(exp_x)
 
     def step(self, state, action, reward, next_state, done):
+           
+        #    Modulation of PL by ACC:
+        # IPLACC(t)=g(∑m=1MU(am)⋅WmACC-PL)
+        # IPLACC​(t)=g(m=1∑M​U(am​)⋅WmACC-PL​)
+
+        #     IPLACC(t)IPLACC​(t): Input from the ACC to PL at time tt.
+        #     U(am)U(am​): Utility of action amam​.
+        #     WmACC-PLWmACC-PL​: Synaptic weight between ACC outputs and PL neurons.
+        #     g(⋅)g(⋅): Modulation function that increases or decreases PL activity based on the computed utility.
 
 
 input_size = grid_size * 2

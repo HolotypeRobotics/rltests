@@ -1,9 +1,10 @@
-# ACC Model for Action Selection and Task Switching
-
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class ACCModel:
-    def __init__(self, num_actions, num_outcomes, state_dim, alpha=0.1, gamma=0.9, k_effort=0.1, volatility_lr=0.1, switch_threshold=0.5):
+    def __init__(self, num_actions, num_outcomes, state_dim, alpha=0.1, gamma=0.9, k_effort=0.1, volatility_lr=0.1, switch_threshold=0.5, temperature=1.0):
         self.num_actions = num_actions
         self.num_outcomes = num_outcomes
         self.state_dim = state_dim
@@ -12,139 +13,16 @@ class ACCModel:
         self.k_effort = k_effort  # Effort discount parameter
         self.volatility_lr = volatility_lr  # Volatility learning rate
         self.switch_threshold = switch_threshold  # Threshold for task switching
+        self.temperature = temperature  # Temperature for softmax action selection
+
+        # Weights (GRU)
+        
         
         # Initialize outcome predictions for each state-action pair
         self.outcome_predictions = np.zeros((state_dim, num_actions, num_outcomes))
         
         # Initialize state-action values
         self.state_action_values = np.zeros((state_dim, num_actions))
-
-
-    def value_representation_update(self, v_old, reward):
-        """Update value representation based on feedback"""
-        prediction_error = reward - v_old
-        v_new = v_old + self.alpha * prediction_error
-        return v_new, prediction_error
-
-    def expected_value_of_control(self, p_states, rewards, costs):
-        """Compute the Expected Value of Control"""
-        return np.sum([p * (r - c) for p, r, c in zip(p_states, rewards, costs)])
-
-    def temporal_discounting(self, reward, time, k=0.1):
-        """Apply temporal discounting to a reward"""
-        return reward / (1 + k * time)
-
-    def conflict_monitoring(self, r_correct, r_error, p_conflict):
-        """Compute the conflict signal"""
-        return np.sum((r_correct - r_error) * p_conflict)
-
-    def cost_benefit_ratio(self, reward, effort):
-        """Compute the cost-benefit ratio"""
-        return reward / effort
-
-    def error_related_negativity(self, erp_error, erp_correct):
-        """Compute the Error-Related Negativity"""
-        return erp_error - erp_correct
-
-    def surprise(self, probability):
-        """Compute surprise based on information theory"""
-        return -np.log2(probability)
-
-    def update_volatility(self, volatility, prediction_error):
-        """Update volatility estimate"""
-        return volatility + self.volatility_lr * prediction_error
-
-    def subjective_value(self, reward, effort):
-        """Compute subjective value with effort discounting"""
-        return reward * (1 - self.k_effort * effort)
-
-    def action_outcome_contingency(self, p_outcome_given_action, p_outcome_given_no_action):
-        """Compute action-outcome contingency"""
-        return p_outcome_given_action - p_outcome_given_no_action
-
-    def hierarchical_error(self, reward, value_next, value_current):
-        """Compute hierarchical prediction error"""
-        return reward + self.gamma * value_next - value_current
-
-    # Proper goal-directed behavior requires that an organism internalizes
-    # behaviorally relevant stimuli, brings appropriate stimulus–response
-    # rules online, and monitors outcomes to adjust behavior accordingly.
-    # Preparatory attention or the selection of task-relevant stimuli is
-    # critical for the execution of proper goal-directed behavior.
-    def preparatory_attention(self, x, x_bar, alpha=0.1):
-        """Compute preparatory attention gain"""
-        return 1 + alpha * (x - x_bar)
-
-    def task_switching_cost(self, current_task, previous_task, switch_cost=0.2):
-        """Compute task switching cost"""
-        return switch_cost if current_task != previous_task else 0
-
-    def select_task_set(self, task_sets, context, performance_history):
-        """Select the appropriate task set based on context and performance history"""
-        task_set_scores = {}
-        for task_set in task_sets:
-            # Compute a score for each task set based on:
-            # 1. Contextual relevance
-            context_score = self.compute_context_relevance(task_set, context)
-            
-            # 2. Historical performance
-            performance_score = self.compute_historical_performance(task_set, performance_history)
-            
-            # 3. Expected value of control
-            evc_score = self.expected_value_of_control(
-                p_states=[0.5, 0.5],  # Simplified probabilities
-                rewards=[performance_score, -performance_score],
-                costs=[self.task_switching_cost(task_set, performance_history[-1][0]), 0]
-            )
-            
-            # Combine scores (you can adjust the weights as needed)
-            task_set_scores[task_set] = 0.4 * context_score + 0.3 * performance_score + 0.3 * evc_score
-
-        # Select the task set with the highest score
-        return max(task_set_scores, key=task_set_scores.get)
-
-    def compute_context_relevance(self, task_set, context):
-        """Compute the relevance of a task set to the current context"""
-        # This is a placeholder function. In a real implementation, you would define
-        # how to measure the relevance of a task set to the given context.
-        return np.random.random()  # Replace with actual relevance computation
-
-    def compute_historical_performance(self, task_set, performance_history):
-        """Compute the historical performance of a task set"""
-        relevant_performances = [perf for ts, perf in performance_history if ts == task_set]
-        return np.mean(relevant_performances) if relevant_performances else 0.5
-
-    def simulate_task_switching(self, num_trials, task_sets, initial_task):
-        """Simulate ACC-based task switching process"""
-        current_task = initial_task
-        performance_history = []
-        task_switches = []
-        volatility = 0.1
-        conflict = 0.5
-
-        for _ in range(num_trials):
-            # Simulate task performance (simplified)
-            performance = np.random.normal(0.7, 0.1)  # Mean performance of 0.7 with some variance
-            performance_history.append((current_task, performance))
-
-            # Update volatility (simplified)
-            volatility = self.update_volatility(volatility, 0.7 - performance)
-
-            # Detect if a task switch is needed
-            if self.detect_task_switch_need(performance, volatility, conflict):
-                # Select new task set
-                new_task = self.select_task_set(task_sets, context="current_context", performance_history=performance_history)
-                
-                if new_task != current_task:
-                    task_switches.append((_+1, current_task, new_task))
-                    current_task = new_task
-
-            # Update conflict (simplified)
-            conflict = max(0, min(1, conflict + np.random.normal(0, 0.1)))
-
-        return performance_history, task_switches
-
-
 
     def predict_outcomes(self, state, action):
         """Predict multiple outcomes for a given state-action pair"""
@@ -185,11 +63,11 @@ class ACCModel:
             potential_surprise = self.compute_surprise(-predictions)
             q_value = self.state_action_values[state_index, action]
             
-            # Combine value, surprise, and Q-value (adjust weights as needed)
+            # Combine value, surprise, and Q-value
             action_values[action] = 0.4 * expected_value + 0.3 * potential_surprise + 0.3 * q_value
 
         # Softmax decision rule
-        probabilities = np.exp(action_values) / np.sum(np.exp(action_values))
+        probabilities = np.exp(action_values / self.temperature) / np.sum(np.exp(action_values / self.temperature))
         return np.random.choice(self.num_actions, p=probabilities)
 
     def detect_task_switch_need(self, surprise, volatility, conflict):
@@ -197,12 +75,23 @@ class ACCModel:
         switch_probability = surprise * volatility * conflict
         return switch_probability > self.switch_threshold
 
-    def simulate_decision_making(self, num_trials, initial_state, transition_prob=0.1, volatility=0.1, conflict=0.5):
+    def update_volatility(self, volatility, prediction_error):
+        """Update volatility estimate"""
+        return np.clip(volatility + self.volatility_lr * np.abs(prediction_error), 0, 1)
+
+    def compute_conflict(self, action_values):
+        """Compute conflict as the similarity between top action values"""
+        sorted_values = np.sort(action_values)[::-1]
+        return 1 - (sorted_values[0] - sorted_values[1]) / sorted_values[0] if sorted_values[0] != 0 else 1
+
+    def simulate_decision_making(self, num_trials, initial_state, transition_prob=0.1):
         """Simulate ACC-based decision-making process with PL state"""
         choices = []
         surprises = []
         switches = []
         states = [initial_state]
+        volatility = 0.1
+        conflict = 0.5
 
         for _ in range(num_trials):
             current_state = states[-1]
@@ -223,6 +112,13 @@ class ACCModel:
             # Update state-action values
             self.update_state_action_values(current_state, action, reward)
 
+            # Compute conflict
+            action_values = [self.state_action_values[np.argmax(current_state), a] for a in range(self.num_actions)]
+            conflict = self.compute_conflict(action_values)
+
+            # Update volatility
+            volatility = self.update_volatility(volatility, np.mean(prediction_errors))
+
             # Check for task switch
             if self.detect_task_switch_need(surprise, volatility, conflict):
                 switches.append(_)
@@ -234,10 +130,6 @@ class ACCModel:
             else:
                 next_state = current_state
             states.append(next_state)
-
-            # Update volatility and conflict (simplified)
-            volatility = max(0, min(1, volatility + np.random.normal(0, 0.1)))
-            conflict = max(0, min(1, conflict + np.random.normal(0, 0.1)))
 
         return choices, surprises, switches, states
 

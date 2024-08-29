@@ -1,5 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from torch import nn
+import torch
 
 # Configuration parameters
 CONFIG = {
@@ -7,6 +9,17 @@ CONFIG = {
         'size': (100, 100),
         'n_obstacles': 3,
         'n_targets': 3,
+        'n_places': 10,
+        'target_rewards': {
+            'food': 1.0,
+            'water': 0.5,
+            'shelter': 0.3,
+        },
+        'target_stresses': {
+            'food': 0.1,
+            'water': 0.2,
+            'shelter': 0.4,
+        }
     },
     'agent': {
         'hunger_range': (0, 1),
@@ -35,11 +48,36 @@ CONFIG = {
     }
 }
 
+
 class Environment:
     def __init__(self, size, obstacles, targets):
         self.size = size
         self.obstacles = obstacles
         self.targets = targets
+
+# Define PyTorch layer to predict place based on LEC activation
+class PlacePredictionModel(nn.Module):
+    def __init__(self, num_task_sets, num_objects, num_places, hidden_size=64):
+        # super(PlacePredictionModel, self).__init__()
+        # self.fc = nn.Linear(num_task_sets * num_objects, num_places)  # Predicting a single value (e.g., place index or score)
+        # self.sigmoid = nn.Sigmoid()  # Activation function
+
+        super(PlacePredictionModel, self).__init__()
+        self.fc1 = nn.Linear(num_task_sets*num_objects, hidden_size)  # Input layer
+        self.relu = nn.ReLU()  # Activation function
+        self.fc2 = nn.Linear(hidden_size, num_places)  # Output layer
+
+
+    # def forward(self, x):
+    #     x = self.fc(x)
+    #     x = self.sigmoid(x)
+    #     return x
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        output = self.fc2(x)
+        return output
 
 class Agent:
     def __init__(self, x, y, heading, config):
@@ -58,11 +96,53 @@ def dca1_activation(x, y, environment, config):
             activations.append(activation)
     return activations
 
-def vca1_activation(x, y, environment):
-    """Broad allocentric place, unique for each environment."""
-    env_repr = tuple(environment.obstacles) + tuple(target['position'] for target in environment.targets)
-    env_hash = hash(env_repr)
-    return np.sin(2 * np.pi * x / environment.size[0] + env_hash) * np.sin(2 * np.pi * y / environment.size[1] + env_hash)
+def lec_activation(x, y, environment):
+    """Calculate the distance to all objects (obstacles and targets) in the environment."""
+    distances = []
+    # Calculate distances to obstacles
+    for obstacle in environment.obstacles:
+        distance = np.sqrt((x - obstacle[0])**2 + (y - obstacle[1])**2)
+        distances.append(distance)
+    
+    # Calculate distances to targets
+    for target in environment.targets:
+        distance = np.sqrt((x - target['position'][0])**2 + (y - target['position'][1])**2)
+        distances.append(distance)
+    
+    return distances
+
+
+def vca1_activation(x, y, environment, config, task_set_index):
+    """
+    Broad allocentric place prediction using lec_activation as input to a PyTorch model.
+    
+    Parameters:
+    - task_set_index: Current task set index to decide where to input data
+    """
+    # Calculate distances to all objects
+    distances = lec_activation(x, y, environment)
+    
+    # Collect rewards and stresses for all objects (obstacles have 0 reward/stress)
+    rewards = [target['reward'] for target in environment.targets] + [0] * len(environment.obstacles)
+    stresses = [target['stress'] for target in environment.targets] + [0] * len(environment.obstacles)
+    
+    # Calculate input as distances weighted by (reward - stress)
+    weighted_distances = [dist * (reward - stress) for dist, reward, stress in zip(distances, rewards, stresses)]
+    
+    # Prepare input tensor for the model
+    num_objects = len(weighted_distances)
+    input_tensor = torch.zeros(config['environment']['n_targets'] * num_objects)  # assuming a 1D input
+    start_index = task_set_index * num_objects
+    input_tensor[start_index:start_index + num_objects] = torch.tensor(weighted_distances, dtype=torch.float32)
+    
+    # Create model and predict
+    num_task_sets = config['environment']['n_targets']  # Assuming number of task sets is the length of targets list
+    num_places = config['environment']['n_places']
+    model = PlacePredictionModel(num_task_sets, num_objects, num_places)
+    output = model(input_tensor)
+    
+    return output.detach().numpy()
+
 
 def dsub_heading_activation(heading):
     """Broad allocentric environment heading."""
@@ -98,9 +178,9 @@ def ica1_activation(agent, environment, config):
             transitions.append(transition)
     return transitions
 
-def simulate_hippocampal_activity(agent, environment, config):
+def simulate_hippocampal_activity(agent, environment, config, task_set_index):
     dca1 = dca1_activation(agent.x, agent.y, environment, config)
-    vca1 = vca1_activation(agent.x, agent.y, environment)
+    vca1 = vca1_activation(agent.x, agent.y, environment, CONFIG, task_set_index)
     dsub_heading = dsub_heading_activation(agent.heading)
     dsub_directions = dsub_direction_options(agent.x, agent.y, environment, config)
     vsub = vsub_activation(agent, environment)
@@ -108,7 +188,7 @@ def simulate_hippocampal_activity(agent, environment, config):
     
     return {
         'dCA1': dca1,
-        'vCA1': vca1,
+        'vCA1': vca1[0],
         'dSub_heading': dsub_heading,
         'dSub_directions': dsub_directions,
         'vSub': vsub,
@@ -147,7 +227,7 @@ def visualize_environment(agent, environment, hippocampal_activity, config):
     plt.title("Simulated Environment and Hippocampal Activations")
     plt.show()
 
-def visualize_region_activations(environment, agent, config):
+def visualize_region_activations(environment, agent, config, task_set_index):
     fig, axs = plt.subplots(*config['visualization']['subplot_layout'], figsize=(18, 12))
     axs = axs.flatten()
     
@@ -162,7 +242,7 @@ def visualize_region_activations(environment, agent, config):
     axs[0].set_title('dCA1 Activation (Average)')
     
     # vCA1
-    Z_vca1 = np.vectorize(lambda x, y: vca1_activation(x, y, environment))(X, Y)
+    Z_vca1 = np.vectorize(lambda x, y: vca1_activation(x, y, environment, config, task_set_index)[0])(X, Y)
     axs[1].imshow(Z_vca1, extent=[0, environment.size[0], 0, environment.size[1]], origin='lower', cmap='viridis')
     axs[1].set_title('vCA1 Activation')
     
@@ -207,8 +287,69 @@ def visualize_region_activations(environment, agent, config):
     plt.tight_layout()
     plt.show()
 
-# Example usage
+def visualize_vsub(agent, environment, config):
+    """Visualize the vSub distances weighted by sensitivities."""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    distances = vsub_activation(agent, environment)
+    target_types = list(distances.keys())
+    distance_values = list(distances.values())
+    
+    ax.bar(target_types, distance_values, color=['green', 'blue', 'purple'])
+    ax.set_ylabel('Weighted Distance')
+    ax.set_title('vSub Target Distances (Weighted by Sensitivity)')
+    
+    plt.show()
+
+def visualize_dca1_grids(environment, config):
+    """Visualize the dCA1 activation patterns for different scales and offsets."""
+    scales = config['dca1']['scales']
+    offsets = config['dca1']['offsets']
+    
+    fig, axs = plt.subplots(len(scales), len(offsets), figsize=(15, 10))
+    resolution = config['visualization']['grid_resolution']
+    x = np.linspace(0, environment.size[0], resolution)
+    y = np.linspace(0, environment.size[1], resolution)
+    X, Y = np.meshgrid(x, y)
+    
+    for i, scale in enumerate(scales):
+        for j, offset in enumerate(offsets):
+            Z = np.sin(2 * np.pi * (X + offset[0]) / scale) * np.sin(2 * np.pi * (Y + offset[1]) / scale)
+            ax = axs[i, j]
+            ax.imshow(Z, extent=[0, environment.size[0], 0, environment.size[1]], origin='lower', cmap='viridis')
+            ax.set_title(f'Scale: {scale}, Offset: {offset}')
+            ax.scatter(*zip(*environment.obstacles), color='red', s=20)
+            for target in environment.targets:
+                ax.scatter(*target['position'], color='green', s=20)
+    
+    plt.tight_layout()
+    plt.show()
+
+def visualize_ica1_transitions(environment, config):
+    """Visualize iCA1 transition points across the grid."""
+    resolution = config['visualization']['grid_resolution']
+    x = np.linspace(0, environment.size[0], resolution)
+    y = np.linspace(0, environment.size[1], resolution)
+    X, Y = np.meshgrid(x, y)
+    
+    Z = np.zeros_like(X)
+    for i in range(X.shape[0]):
+        for j in range(X.shape[1]):
+            temp_agent = Agent(X[i,j], Y[i,j], 0, config)
+            transitions = ica1_activation(temp_agent, environment, config)
+            Z[i,j] = len(transitions)
+    
+    plt.figure(figsize=(8, 6))
+    plt.imshow(Z, extent=[0, environment.size[0], 0, environment.size[1]], origin='lower', cmap='viridis')
+    plt.scatter(*zip(*environment.obstacles), color='red', s=20, label='Obstacles')
+    for target in environment.targets:
+        plt.scatter(*target['position'], color='green', s=20, label=f"{target['type']}")
+    plt.title('iCA1 Transition Points')
+    plt.colorbar(label='Number of Transitions')
+    plt.show()
+
 def create_random_environment(config):
+    """Creates a random environment with obstacles and targets using the configuration."""
     size = config['environment']['size']
     obstacles = [(np.random.randint(0, size[0]), np.random.randint(0, size[1])) 
                  for _ in range(config['environment']['n_obstacles'])]
@@ -216,6 +357,13 @@ def create_random_environment(config):
                 'type': np.random.choice(['food', 'water', 'shelter']),
                 'value': np.random.random()} 
                for _ in range(config['environment']['n_targets'])]
+    
+    # Add rewards and stresses to targets based on their type
+    for target in targets:
+        target_type = target['type']
+        target['reward'] = config['environment']['target_rewards'][target_type]
+        target['stress'] = config['environment']['target_stresses'][target_type]
+    
     return Environment(size, obstacles, targets)
 
 environment = create_random_environment(CONFIG)
@@ -224,9 +372,12 @@ agent = Agent(x=np.random.randint(0, environment.size[0]),
               heading=np.random.uniform(0, 2*np.pi),
               config=CONFIG)
 
-# Visualize single point activations
-hippocampal_activity = simulate_hippocampal_activity(agent, environment, CONFIG)
-visualize_environment(agent, environment, hippocampal_activity, CONFIG)
+task_set_index = 0 
 
-# Visualize region activations using meshgrid
-visualize_region_activations(environment, agent, CONFIG)
+hippocampal_activity = simulate_hippocampal_activity(agent, environment, CONFIG, task_set_index)
+
+visualize_vsub(agent, environment, CONFIG)
+visualize_dca1_grids(environment, CONFIG)
+visualize_environment(agent, environment, hippocampal_activity, CONFIG)
+visualize_region_activations(environment, agent, CONFIG, task_set_index)
+visualize_ica1_transitions(environment, CONFIG)

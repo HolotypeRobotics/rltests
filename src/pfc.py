@@ -3,6 +3,18 @@ import torch.nn as nn
 import numpy as np
 from environment import Environment
 
+# HP to PL:
+# fine allocentric position
+# broad allocentric position
+# place
+# broad allocentric direction
+# egocentric goal distances
+# possible egocentric transition points
+
+# place is predicted based on transition from environment to environment
+# requies RNN for pattern completion and sequence learning to predict the place.
+# the rnn should take in the speed and dirction, or the grid cells as imput
+
 # Resembles the Prelimbic Cortex (PL) in the rodent brain
 # predicts next step in plan
 class GRUNetwork(nn.Module):

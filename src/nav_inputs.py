@@ -143,7 +143,6 @@ def vca1_activation(x, y, environment, config, task_set_index):
     
     return output.detach().numpy()
 
-
 def dsub_heading_activation(heading):
     """Broad allocentric environment heading."""
     return (np.sin(heading) + 1) / 2

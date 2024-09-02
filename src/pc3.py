@@ -6,30 +6,6 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torch.autograd
 
-'''
-
-    This is a simple implementation of a hippocampal circuit model using PyTorch.
-It takes in grid cell-like inputs from the entorhinal cortex (EC) and object location
-inputs from the lateral entorhinal cortex (LEC). The CA3 module predicts the next input
-based on the current input and hidden state. The CA1 module combines the CA3 and EC
-inputs to predict the place fields. The model is trained to predict the center of the
-place fields with the locations of previous salient stimuli at the center.
-
-    The model can be used more in a prediction-like manner with the CA3 module
-predicting the next input. Or it can be used in a more based on current raw inputs
-from the MEC and LEC. This is controlled by percentages of reality and prediction
-in the CA1 module.
-
-    The idea is that the prediction of place cells in CA3 is used for tracking and recalling
-salient stimuli in the environment for later use. e.g. for remembering the location of landmarks 
-on the way to a reward.
-
-This should show if places are experienced/learned in a sequence, and then if the end of the 
-sequence is moved, then learned, other places should move too because of RNN/CA3 prediction.
-
-''' 
-
-# Define MEC activation function using periodic activity like grid cells with overlapping increasing sizes and offsets
 def mec_activation(x, y, config):
     activations = []
     for scale in config['mec']['scales']:
@@ -38,7 +14,6 @@ def mec_activation(x, y, config):
             activations.append(activation)
     return np.array(activations, dtype=np.float32)
 
-# Define LEC activation function using distance to specific objects in the environment
 def lec_activation(x, y, environment):
     activations = []
     for target in environment['place_field_targets']:
@@ -50,26 +25,19 @@ def lec_activation(x, y, environment):
 class CA3(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(CA3, self).__init__()
-        # Projections from EC to CA3 (skipping DG)
         self.input_projection = nn.Linear(input_size, hidden_size)
-        # Recurrent connections
         self.rnn = nn.RNN(hidden_size, hidden_size, batch_first=True)
-        # Output projections to CA1
         self.output = nn.Linear(hidden_size, output_size)
 
     def forward(self, input, hidden_state=None):
-        # Project input to hidden state
         projected_input = F.relu(self.input_projection(input)).unsqueeze(1)
-        # Recurrent activation
         output, hidden_state = self.rnn(projected_input, hidden_state)
-        # Output
         predicted_ec = self.output(output.squeeze(1))
         return predicted_ec, hidden_state
 
 class CA1(nn.Module):
     def __init__(self, ec_input_size, output_size):
         super(CA1, self).__init__()
-        # Projections from EC to CA1
         self.process_ec = nn.Linear(ec_input_size, output_size)
 
     def forward(self, ec_input):
@@ -78,24 +46,19 @@ class CA1(nn.Module):
 class HippocampalCircuit(nn.Module):
     def __init__(self, ec_input_size, hidden_size, num_place_fields):
         super(HippocampalCircuit, self).__init__()
-        # Number of place fields we want to predict
         self.num_place_fields = num_place_fields
-        # CA3 and CA1 modules
         self.ca3 = CA3(ec_input_size, hidden_size, num_place_fields)
         self.ca1 = CA1(ec_input_size, num_place_fields)
 
     def forward(self, ec_input, hidden_state=None, reality=0.5, prediction=0.5):
-        # have ca3 predict the next input from its hidden state
         ca3_prediction, hidden_state = self.ca3(ec_input, hidden_state)
-        # have ec-ca1 net predict place from raw inputs
         ca1_output = self.ca1(ec_input)
-        # Combine the predictions based on reality and prediction percentages
+        
         combined_output = prediction * ca3_prediction + reality * ca1_output
         place_field_activations = torch.sigmoid(combined_output)
         
         return place_field_activations, ca3_prediction, hidden_state
 
-# Generate a path by taking steps in random directions
 def generate_path(num_steps, step_size=0.05):
     path = torch.zeros(num_steps, 2, dtype=torch.float32)
     current_position = torch.rand(2, dtype=torch.float32)
@@ -160,54 +123,6 @@ def train_model(model, config, num_epochs, learning_rate, bptt_len=30):
 
     return model
 
-
-def train_model_on_moved_target(model, config, num_epochs, learning_rate, bptt_len=30):
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
-
-    moved_target_index = len(config['environment']['place_field_targets']) - 1
-
-    for epoch in range(num_epochs):
-        path = generate_path(config['num_steps'])
-        hidden_state = None
-        total_loss = 0
-
-        for step in range(0, config['num_steps'] - bptt_len, bptt_len):
-            optimizer.zero_grad()
-            losses = []
-            hidden_state = hidden_state.detach() if hidden_state is not None else None
-
-            for sub_step in range(bptt_len):
-                position = path[step + sub_step]
-                ec_input = torch.cat([
-                    torch.tensor(mec_activation(position[0].item(), position[1].item(), config), dtype=torch.float32),
-                    torch.tensor(lec_activation(position[0].item(), position[1].item(), config['environment']), dtype=torch.float32)
-                ])
-                
-                place_field_activations, _, hidden_state = model(ec_input.unsqueeze(0), hidden_state)
-                
-                # Calculate target place field activation only for the moved target
-                target_activations = torch.zeros_like(place_field_activations)
-                target_activation = config['environment']['place_field_targets'][moved_target_index]['activation'](position[0].item(), position[1].item())
-                target_activations[0, moved_target_index] = target_activation  # Only update the last place field target
-                
-                # Calculate the loss only for the moved target
-                loss = criterion(place_field_activations[0, moved_target_index], target_activations[0, moved_target_index])
-                losses.append(loss)
-
-            # Accumulate losses and perform a single backward pass
-            batch_loss = torch.stack(losses).mean()
-            batch_loss.backward()
-            optimizer.step()
-
-            total_loss += batch_loss.item()
-        
-        if (epoch + 1) % 20 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/(config['num_steps']/bptt_len):.4f}")
-
-    return model
-
 def predict_sequence(model, start_position, num_steps, config):
     model.eval()
     predictions = []
@@ -232,7 +147,7 @@ def predict_sequence(model, start_position, num_steps, config):
 
 def visualize_place_fields(model, config):
     model.eval()
-    resolution = 100
+    resolution = 20
     x = np.linspace(0, 1, resolution)
     y = np.linspace(0, 1, resolution)
     xx, yy = np.meshgrid(x, y)
@@ -268,10 +183,9 @@ def visualize_place_fields(model, config):
     plt.tight_layout()
     plt.show()
 
-
 if __name__ == "__main__":
     config = {
-        'num_steps': 1000,
+        'num_steps': 2000,
         'mec': {
             'scales': [0.2, 0.4, 0.6],
             'offsets': [(0, 0), (0.1, 0.1), (0.2, 0.2)]
@@ -292,26 +206,12 @@ if __name__ == "__main__":
     model = HippocampalCircuit(ec_input_size, hidden_size, num_place_fields)
     model.float()
 
-    # Initial training on all place field targets
     trained_model = train_model(model, config, num_epochs=100, learning_rate=0.001)
-    print("Place field activations after initial training:")
     visualize_place_fields(trained_model, config)
-
-    # Move the last place field target
-    new_position = (0.9, 0.9)
-    config['environment']['place_field_targets'][-1] = {
-        'position': new_position,
-        'activation': create_place_field_target(new_position)
-    }
-
-    # Retrain the model only on the moved target
-    trained_model_on_moved_target = train_model_on_moved_target(trained_model, config, num_epochs=100, learning_rate=0.001)
-    print("Place field activations after retraining on moved target:")
-    visualize_place_fields(trained_model_on_moved_target, config)
 
     # Predict a sequence starting from a random position
     start_position = torch.rand(2)
-    predicted_sequence = predict_sequence(trained_model_on_moved_target, start_position, num_steps=20, config=config)
+    predicted_sequence = predict_sequence(trained_model, start_position, num_steps=20, config=config)
 
     # Visualize the predicted sequence
     plt.figure(figsize=(10, 5))

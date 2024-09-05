@@ -48,7 +48,7 @@ class ShapePredictorRNN(nn.Module):
 num_sequences = 10
 num_shapes = 3
 sequence_length = 10
-hidden_size = 6
+hidden_size = 1
 input_size = num_sequences + sequence_length
 output_size = num_shapes
 num_epochs = 100
@@ -59,7 +59,7 @@ env.generate_sequences(num_sequences, sequence_length, num_shapes)
 # Instantiate the RNN
 model = ShapePredictorRNN(input_size, hidden_size, output_size)
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.Adam(model.parameters(), lr=.01)
 
 # Training loop
 losses = []

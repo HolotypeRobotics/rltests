@@ -50,10 +50,17 @@ def lec_activation(x, y, environment):
 class CA3(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(CA3, self).__init__()
+        self.input_size = input_size
         # Projections from EC to CA3 (skipping DG)
         self.input_projection = nn.Linear(input_size, hidden_size)
         # Recurrent connections
         self.rnn = nn.RNN(hidden_size, hidden_size, batch_first=True)
+
+        # Initialize weights and biases to zero
+        for name, param in self.rnn.named_parameters():
+            if 'weight' in name or 'bias' in name:
+                nn.init.constant_(param.data, 0.0)
+                
         # Output projections to CA1
         self.output = nn.Linear(hidden_size, output_size)
 
@@ -70,10 +77,12 @@ class CA1(nn.Module):
     def __init__(self, ec_input_size, output_size):
         super(CA1, self).__init__()
         # Projections from EC to CA1
+        self.ec_input_size = ec_input_size
         self.process_ec = nn.Linear(ec_input_size, output_size)
 
     def forward(self, ec_input):
-        return F.relu(self.process_ec(ec_input))
+        out = self.process_ec(ec_input)
+        return F.relu(out)
 
 class HippocampalCircuit(nn.Module):
     def __init__(self, ec_input_size, hidden_size, num_place_fields):
@@ -82,16 +91,17 @@ class HippocampalCircuit(nn.Module):
         self.num_place_fields = num_place_fields
         # CA3 and CA1 modules
         self.ca3 = CA3(ec_input_size, hidden_size, num_place_fields)
-        self.ca1 = CA1(ec_input_size, num_place_fields)
+        # self.ca1 = CA1(ec_input_size, num_place_fields)
 
-    def forward(self, ec_input, hidden_state=None, reality=0.5, prediction=0.5):
+    def forward(self, ec_input, hidden_state=None, reality=0.1, prediction=0.9):
         # have ca3 predict the next input from its hidden state
-        ca3_prediction, hidden_state = self.ca3(ec_input, hidden_state)
+        ca3_prediction, hidden_state = (self.ca3(ec_input, hidden_state))
         # have ec-ca1 net predict place from raw inputs
-        ca1_output = self.ca1(ec_input)
+        # ca1_output = self.ca1(ec_input)
         # Combine the predictions based on reality and prediction percentages
-        combined_output = prediction * ca3_prediction + reality * ca1_output
-        place_field_activations = torch.sigmoid(combined_output)
+        # combined_output = prediction * ca3_prediction + reality * ca1_output
+        # place_field_activations = torch.tanh(combined_output)
+        place_field_activations = torch.tanh(ca3_prediction)
         
         return place_field_activations, ca3_prediction, hidden_state
 
@@ -271,22 +281,24 @@ def visualize_place_fields(model, config):
 
 if __name__ == "__main__":
     config = {
-        'num_steps': 1000,
+        'num_steps': 100,
         'mec': {
-            'scales': [0.2, 0.4, 0.6],
-            'offsets': [(0, 0), (0.1, 0.1), (0.2, 0.2)]
+            'scales': [ 1, 0.5],
+            'offsets': [(0, 1), (1,0)]
         },
         'environment': {
             'place_field_targets': [
                 {'position': (0.2, 0.3), 'activation': create_place_field_target((0.2, 0.3))},
-                {'position': (0.7, 0.8), 'activation': create_place_field_target((0.7, 0.8))},
-                {'position': (0.5, 0.5), 'activation': create_place_field_target((0.5, 0.5))}
+                {'position': (0.7, 0.8), 'activation': create_place_field_target((0.5, 0.1))},
+                {'position': (0.5, 0.5), 'activation': create_place_field_target((0.3, 0.5))},
+                {'position': (0.1, 0.9), 'activation': create_place_field_target((0.7, 0.7))},
+                {'position': (0.9, 0.1), 'activation': create_place_field_target((0.9, 0.9))},
             ]
         }
     }
 
     ec_input_size = len(config['mec']['scales']) * len(config['mec']['offsets']) + len(config['environment']['place_field_targets'])
-    hidden_size = 64
+    hidden_size = 100
     num_place_fields = len(config['environment']['place_field_targets'])
     
     model = HippocampalCircuit(ec_input_size, hidden_size, num_place_fields)
@@ -311,7 +323,7 @@ if __name__ == "__main__":
 
     # Predict a sequence starting from a random position
     start_position = torch.rand(2)
-    predicted_sequence = predict_sequence(trained_model_on_moved_target, start_position, num_steps=20, config=config)
+    predicted_sequence = predict_sequence(trained_model_on_moved_target, start_position, num_steps=200, config=config)
 
     # Visualize the predicted sequence
     plt.figure(figsize=(10, 5))

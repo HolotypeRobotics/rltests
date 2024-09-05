@@ -2,322 +2,126 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
-import torch.nn.functional as F
-import torch.autograd
+from collections import deque
 
-'''
+GRID_SIZE = 10
+MAX_STEPS = 200
+HIDDEN_SIZE = 64
+TRAJECTORY_LENGTH = 5
+NUM_SHAPES = 4
 
-    This is a simple implementation of a hippocampal circuit model using PyTorch.
-It takes in grid cell-like inputs from the entorhinal cortex (EC) and object location
-inputs from the lateral entorhinal cortex (LEC). The CA3 module predicts the next input
-based on the current input and hidden state. The CA1 module combines the CA3 and EC
-inputs to predict the place fields. The model is trained to predict the center of the
-place fields with the locations of previous salient stimuli at the center.
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    The model can be used more in a prediction-like manner with the CA3 module
-predicting the next input. Or it can be used in a more based on current raw inputs
-from the MEC and LEC. This is controlled by percentages of reality and prediction
-in the CA1 module.
+class GridEnvironment:
+    def __init__(self, size=GRID_SIZE):
+        self.size = size
+        self.grid = np.zeros((size, size), dtype=int)
+        self.agent_pos = [0, 0]
+        self.place_shapes()
 
-    The idea is that the prediction of place cells in CA3 is used for tracking and recalling
-salient stimuli in the environment for later use. e.g. for remembering the location of landmarks 
-on the way to a reward.
+    def place_shapes(self):
+        for _ in range(NUM_SHAPES):
+            x, y = np.random.randint(0, self.size), np.random.randint(0, self.size)
+            shape = np.random.randint(1, NUM_SHAPES + 1)
+            self.grid[x, y] = shape
 
-This should show if places are experienced/learned in a sequence, and then if the end of the 
-sequence is moved, then learned, other places should move too because of RNN/CA3 prediction.
+    def step(self, action):
+        # 0: up, 1: right, 2: down, 3: left
+        dx, dy = [(-1, 0), (0, 1), (1, 0), (0, -1)][action]
+        new_x, new_y = self.agent_pos[0] + dx, self.agent_pos[1] + dy
+        if 0 <= new_x < self.size and 0 <= new_y < self.size:
+            self.agent_pos = [new_x, new_y]
+        return self.agent_pos, self.grid[self.agent_pos[0], self.agent_pos[1]]
 
-''' 
+class ShapePredictionModel(nn.Module):
+    def __init__(self, trajectory_length, hidden_size, num_shapes):
+        super(ShapePredictionModel, self).__init__()
+        self.lstm = nn.LSTM(2, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_shapes + 1)  # +1 for "no shape"
 
-# Define MEC activation function using periodic activity like grid cells with overlapping increasing sizes and offsets
-def mec_activation(x, y, config):
-    activations = []
-    for scale in config['mec']['scales']:
-        for offset in config['mec']['offsets']:
-            activation = np.sin(2 * np.pi * (x + offset[0]) / scale) * np.sin(2 * np.pi * (y + offset[1]) / scale)
-            activations.append(activation)
-    return np.array(activations, dtype=np.float32)
+    def forward(self, trajectory):
+        lstm_out, _ = self.lstm(trajectory)
+        return self.fc(lstm_out[:, -1, :])
 
-# Define LEC activation function using distance to specific objects in the environment
-def lec_activation(x, y, environment):
-    activations = []
-    for target in environment['place_field_targets']:
-        distance = np.sqrt((x - target['position'][0])**2 + (y - target['position'][1])**2)
-        activation = np.exp(-distance / 0.2)  # Gaussian activation
-        activations.append(activation)
-    return np.array(activations, dtype=np.float32)
+class Agent:
+    def __init__(self, model, trajectory_length):
+        self.model = model
+        self.optimizer = optim.Adam(model.parameters())
+        self.trajectory = deque(maxlen=trajectory_length)
+        self.criterion = nn.CrossEntropyLoss()
 
-class CA3(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(CA3, self).__init__()
-        # Projections from EC to CA3 (skipping DG)
-        self.input_projection = nn.Linear(input_size, hidden_size)
-        # Recurrent connections
-        self.rnn = nn.RNN(hidden_size, hidden_size, batch_first=True)
-        # Output projections to CA1
-        self.output = nn.Linear(hidden_size, output_size)
+    def add_to_trajectory(self, position):
+        self.trajectory.append(position)
 
-    def forward(self, input, hidden_state=None):
-        # Project input to hidden state
-        projected_input = F.relu(self.input_projection(input)).unsqueeze(1)
-        # Recurrent activation
-        output, hidden_state = self.rnn(projected_input, hidden_state)
-        # Output
-        predicted_ec = self.output(output.squeeze(1))
-        return predicted_ec, hidden_state
+    def predict(self):
+        if len(self.trajectory) < self.trajectory.maxlen:
+            return None
+        with torch.no_grad():
+            trajectory_tensor = torch.tensor(list(self.trajectory), dtype=torch.float32).unsqueeze(0).to(device)
+            prediction = self.model(trajectory_tensor)
+            return torch.softmax(prediction, dim=1).squeeze().cpu().numpy()
 
-class CA1(nn.Module):
-    def __init__(self, ec_input_size, output_size):
-        super(CA1, self).__init__()
-        # Projections from EC to CA1
-        self.process_ec = nn.Linear(ec_input_size, output_size)
+    def learn(self, true_shape):
+        if len(self.trajectory) < self.trajectory.maxlen:
+            return
+        trajectory_tensor = torch.tensor(list(self.trajectory), dtype=torch.float32).unsqueeze(0).to(device)
+        true_shape_tensor = torch.tensor([true_shape], dtype=torch.long).to(device)
 
-    def forward(self, ec_input):
-        return F.relu(self.process_ec(ec_input))
+        self.optimizer.zero_grad()
+        prediction = self.model(trajectory_tensor)
+        loss = self.criterion(prediction, true_shape_tensor)
+        loss.backward()
+        self.optimizer.step()
 
-class HippocampalCircuit(nn.Module):
-    def __init__(self, ec_input_size, hidden_size, num_place_fields):
-        super(HippocampalCircuit, self).__init__()
-        # Number of place fields we want to predict
-        self.num_place_fields = num_place_fields
-        # CA3 and CA1 modules
-        self.ca3 = CA3(ec_input_size, hidden_size, num_place_fields)
-        self.ca1 = CA1(ec_input_size, num_place_fields)
+def train():
+    env = GridEnvironment()
+    model = ShapePredictionModel(TRAJECTORY_LENGTH, HIDDEN_SIZE, NUM_SHAPES).to(device)
+    agent = Agent(model, TRAJECTORY_LENGTH)
 
-    def forward(self, ec_input, hidden_state=None, reality=0.5, prediction=0.5):
-        # have ca3 predict the next input from its hidden state
-        ca3_prediction, hidden_state = self.ca3(ec_input, hidden_state)
-        # have ec-ca1 net predict place from raw inputs
-        ca1_output = self.ca1(ec_input)
-        # Combine the predictions based on reality and prediction percentages
-        combined_output = prediction * ca3_prediction + reality * ca1_output
-        place_field_activations = torch.sigmoid(combined_output)
-        
-        return place_field_activations, ca3_prediction, hidden_state
+    for step in range(MAX_STEPS):
+        action = np.random.randint(0, 4)
+        position, shape = env.step(action)
+        agent.add_to_trajectory(position)
+        agent.learn(shape)
 
-# Generate a path by taking steps in random directions
-def generate_path(num_steps, step_size=0.05):
-    path = torch.zeros(num_steps, 2, dtype=torch.float32)
-    current_position = torch.rand(2, dtype=torch.float32)
-    path[0] = current_position
-    for i in range(1, num_steps):
-        direction = torch.randn(2, dtype=torch.float32)
-        direction /= direction.norm()
-        new_position = current_position + step_size * direction
-        new_position = torch.clamp(new_position, 0, 1)
-        path[i] = new_position
-        current_position = new_position
-    return path
+        if (step + 1) % 10 == 0:
+            print(f"Step {step + 1}")
 
-def create_place_field_target(position, strength=1.0, spread=0.2):
-    def activation(x, y):
-        distance = np.sqrt((x - position[0])**2 + (y - position[1])**2)
-        return strength * np.exp(-distance / spread)
-    return activation
+    return agent
 
-def train_model(model, config, num_epochs, learning_rate, bptt_len=30):
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
+def evaluate(agent, env):
+    predictions = np.zeros((GRID_SIZE, GRID_SIZE, NUM_SHAPES + 1))
+    for x in range(GRID_SIZE):
+        for y in range(GRID_SIZE):
+            agent.trajectory.clear()
+            for _ in range(TRAJECTORY_LENGTH):
+                agent.add_to_trajectory([x, y])
+            prediction = agent.predict()
+            if prediction is not None:
+                predictions[x, y] = prediction
 
-    for epoch in range(num_epochs):
-        path = generate_path(config['num_steps'])
-        hidden_state = None
-        total_loss = 0
+    correct_predictions = 0
+    total_shapes = 0
+    for x in range(GRID_SIZE):
+        for y in range(GRID_SIZE):
+            true_shape = env.grid[x, y]
+            predicted_shape = np.argmax(predictions[x, y])
+            if true_shape > 0:
+                total_shapes += 1
+                if predicted_shape == true_shape:
+                    correct_predictions += 1
 
-        for step in range(0, config['num_steps'] - bptt_len, bptt_len):
-            optimizer.zero_grad()
-            losses = []
-            hidden_state = hidden_state.detach() if hidden_state is not None else None
+    accuracy = correct_predictions / total_shapes if total_shapes > 0 else 0
+    print(f"Prediction Accuracy: {accuracy:.2f}")
 
-            for sub_step in range(bptt_len):
-                position = path[step + sub_step]
-                ec_input = torch.cat([
-                    torch.tensor(mec_activation(position[0].item(), position[1].item(), config), dtype=torch.float32),
-                    torch.tensor(lec_activation(position[0].item(), position[1].item(), config['environment']), dtype=torch.float32)
-                ])
-                
-                place_field_activations, _, hidden_state = model(ec_input.unsqueeze(0), hidden_state)
-                
-                # Calculate target place field activations
-                target_activations = torch.zeros_like(place_field_activations)
-                for i, target in enumerate(config['environment']['place_field_targets']):
-                    target_activation = target['activation'](position[0].item(), position[1].item())
-                    target_activations[0, i] = target_activation
-                
-                loss = criterion(place_field_activations, target_activations)
-                losses.append(loss)
-
-            # Accumulate losses and perform a single backward pass
-            batch_loss = torch.stack(losses).mean()
-            batch_loss.backward()
-            optimizer.step()
-
-            total_loss += batch_loss.item()
-        
-        if (epoch + 1) % 20 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/(config['num_steps']/bptt_len):.4f}")
-
-    return model
-
-
-def train_model_on_moved_target(model, config, num_epochs, learning_rate, bptt_len=30):
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
-
-    moved_target_index = len(config['environment']['place_field_targets']) - 1
-
-    for epoch in range(num_epochs):
-        path = generate_path(config['num_steps'])
-        hidden_state = None
-        total_loss = 0
-
-        for step in range(0, config['num_steps'] - bptt_len, bptt_len):
-            optimizer.zero_grad()
-            losses = []
-            hidden_state = hidden_state.detach() if hidden_state is not None else None
-
-            for sub_step in range(bptt_len):
-                position = path[step + sub_step]
-                ec_input = torch.cat([
-                    torch.tensor(mec_activation(position[0].item(), position[1].item(), config), dtype=torch.float32),
-                    torch.tensor(lec_activation(position[0].item(), position[1].item(), config['environment']), dtype=torch.float32)
-                ])
-                
-                place_field_activations, _, hidden_state = model(ec_input.unsqueeze(0), hidden_state)
-                
-                # Calculate target place field activation only for the moved target
-                target_activations = torch.zeros_like(place_field_activations)
-                target_activation = config['environment']['place_field_targets'][moved_target_index]['activation'](position[0].item(), position[1].item())
-                target_activations[0, moved_target_index] = target_activation  # Only update the last place field target
-                
-                # Calculate the loss only for the moved target
-                loss = criterion(place_field_activations[0, moved_target_index], target_activations[0, moved_target_index])
-                losses.append(loss)
-
-            # Accumulate losses and perform a single backward pass
-            batch_loss = torch.stack(losses).mean()
-            batch_loss.backward()
-            optimizer.step()
-
-            total_loss += batch_loss.item()
-        
-        if (epoch + 1) % 20 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/(config['num_steps']/bptt_len):.4f}")
-
-    return model
-
-def predict_sequence(model, start_position, num_steps, config):
-    model.eval()
-    predictions = []
-    hidden_state = None
-    current_position = start_position
-
-    with torch.no_grad():
-        for _ in range(num_steps):
-            ec_input = torch.cat([
-                torch.tensor(mec_activation(current_position[0].item(), current_position[1].item(), config), dtype=torch.float32),
-                torch.tensor(lec_activation(current_position[0].item(), current_position[1].item(), config['environment']), dtype=torch.float32)
-            ])
-            
-            place_field_activations, _, hidden_state = model(ec_input.unsqueeze(0), hidden_state)
-            predictions.append(place_field_activations.squeeze().numpy())
-            
-            # Update current_position based on the predicted place field activations
-            max_activation_index = torch.argmax(place_field_activations)
-            current_position = torch.tensor(config['environment']['place_field_targets'][max_activation_index]['position'], dtype=torch.float32)
-
-    return np.array(predictions)
-
-def visualize_place_fields(model, config):
-    model.eval()
-    resolution = 100
-    x = np.linspace(0, 1, resolution)
-    y = np.linspace(0, 1, resolution)
-    xx, yy = np.meshgrid(x, y)
-    
-    place_field_maps = []
-    
-    with torch.no_grad():
-        for i in range(len(config['environment']['place_field_targets'])):
-            activations = np.zeros((resolution, resolution))
-            for xi in range(resolution):
-                for yi in range(resolution):
-                    ec_input = torch.cat([
-                        torch.tensor(mec_activation(xx[xi, yi], yy[xi, yi], config), dtype=torch.float32),
-                        torch.tensor(lec_activation(xx[xi, yi], yy[xi, yi], config['environment']), dtype=torch.float32)
-                    ])
-                    place_field_activations, _, _ = model(ec_input.unsqueeze(0))
-                    activations[xi, yi] = place_field_activations[0, i].item()
-            place_field_maps.append(activations)
-    
-    fig, axes = plt.subplots(1, len(place_field_maps), figsize=(5*len(place_field_maps), 5))
-    if len(place_field_maps) == 1:
-        axes = [axes]
-    
-    for i, (ax, field_map) in enumerate(zip(axes, place_field_maps)):
-        im = ax.imshow(field_map, extent=[0, 1, 0, 1], origin='lower')
-        ax.set_title(f"Place Field {i+1}")
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        target_pos = config['environment']['place_field_targets'][i]['position']
-        ax.plot(target_pos[0], target_pos[1], 'r*', markersize=10)
-        fig.colorbar(im, ax=ax)
-    
-    plt.tight_layout()
-    plt.show()
-
+    return predictions
 
 if __name__ == "__main__":
-    config = {
-        'num_steps': 1000,
-        'mec': {
-            'scales': [0.2, 0.4, 0.6],
-            'offsets': [(0, 0), (0.1, 0.1), (0.2, 0.2)]
-        },
-        'environment': {
-            'place_field_targets': [
-                {'position': (0.2, 0.3), 'activation': create_place_field_target((0.2, 0.3))},
-                {'position': (0.7, 0.8), 'activation': create_place_field_target((0.7, 0.8))},
-                {'position': (0.5, 0.5), 'activation': create_place_field_target((0.5, 0.5))}
-            ]
-        }
-    }
+    trained_agent = train()
+    env = GridEnvironment()  # Create a new environment for evaluation
+    predictions = evaluate(trained_agent, env)
 
-    ec_input_size = len(config['mec']['scales']) * len(config['mec']['offsets']) + len(config['environment']['place_field_targets'])
-    hidden_size = 64
-    num_place_fields = len(config['environment']['place_field_targets'])
-    
-    model = HippocampalCircuit(ec_input_size, hidden_size, num_place_fields)
-    model.float()
-
-    # Initial training on all place field targets
-    trained_model = train_model(model, config, num_epochs=100, learning_rate=0.001)
-    print("Place field activations after initial training:")
-    visualize_place_fields(trained_model, config)
-
-    # Move the last place field target
-    new_position = (0.9, 0.9)
-    config['environment']['place_field_targets'][-1] = {
-        'position': new_position,
-        'activation': create_place_field_target(new_position)
-    }
-
-    # Retrain the model only on the moved target
-    trained_model_on_moved_target = train_model_on_moved_target(trained_model, config, num_epochs=100, learning_rate=0.001)
-    print("Place field activations after retraining on moved target:")
-    visualize_place_fields(trained_model_on_moved_target, config)
-
-    # Predict a sequence starting from a random position
-    start_position = torch.rand(2)
-    predicted_sequence = predict_sequence(trained_model_on_moved_target, start_position, num_steps=20, config=config)
-
-    # Visualize the predicted sequence
-    plt.figure(figsize=(10, 5))
-    plt.imshow(predicted_sequence.T, aspect='auto', cmap='viridis')
-    plt.colorbar(label='Place Field Activation')
-    plt.xlabel('Time Step')
-    plt.ylabel('Place Field')
-    plt.title('Predicted Place Field Activations Over Time')
-    plt.show()
+    print("True Environment:")
+    print(env.grid)
+    print("\nPredicted Environment (most likely shape at each position):")
+    print(np.argmax(predictions, axis=2))

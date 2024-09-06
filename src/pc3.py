@@ -3,20 +3,33 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import math
+
+
+"""
+This is a basic example of a sequence prediction task using an RNN. 
+The task is to predict the shape at a given position in a sequence of shapes.
+This will be used as a basis for training place cells in a larger model.
+Please note that this is a simplified example and should not include intricate the details of biological place cells.
+It may still show basic properties of place cells, such as grid-like firing fields, or similarities in remapping behaviors.
+"""
+
+def shape_to_int(shape):
+    return np.argmax(shape)
 
 class Environment:
     def __init__(self):
         self.sequences = []
 
-    def generate_sequences(self, n_sequences, trajectory_length, n_diff_shapes):
+    def generate_sequences(self, n_sequences, trajectory_length, n_diff_shapes, n_shapes_per_sequence):
         for _ in range(n_sequences):
             sequence = []
             # Fill the sequence with no shapes
             for _ in range(trajectory_length):
                 shape = np.zeros(n_diff_shapes)
                 sequence.append(shape)
-            # Add a random number of shapes, selecting from n_diff_shapes
-            for _ in range(np.random.randint(1, 3)):
+            # Add a number of shapes, selecting from n_diff_shapes
+            for _ in range(1, n_shapes_per_sequence):
                 # Select a random position and shape
                 pos = np.random.randint(0, trajectory_length)
                 shape = np.random.randint(0, n_diff_shapes)
@@ -29,81 +42,95 @@ class Environment:
     def get_shape(self, sequence, position):
         return self.sequences[sequence][position]
 
+
 class ShapePredictorRNN(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
+    def __init__(self, num_sequences, embedding_dim, hidden_size, output_size, num_layers=1):
         super(ShapePredictorRNN, self).__init__()
-        self.hidden_size = hidden_size
-        self.rnn = nn.RNN(input_size, hidden_size, batch_first=True)
+        self.embedding_dim = embedding_dim
+        self.embedding = nn.Embedding(num_sequences, embedding_dim)
+        # self.rnn = nn.GRU(embedding_dim + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.rnn = nn.RNN(embedding_dim + embedding_dim, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x, h):
-        out, h = self.rnn(x, h)
-        out = self.fc(out)
+    def forward(self, sequence_idx, position, h=None):
+        embedded_seq = self.embedding(sequence_idx)
+        pos_enc = self.positional_encoding(position, self.embedding_dim)
+        rnn_input = torch.cat((embedded_seq, pos_enc), dim=1).unsqueeze(1)  # Add sequence dimension
+        out, h = self.rnn(rnn_input, h)
+        out = self.fc(out.squeeze(1))  # Remove sequence dimension
         return out, h
 
-    def init_hidden(self, batch_size):
-        return torch.zeros(1, batch_size, self.hidden_size)
+    def positional_encoding(self, position, d_model, max_len=1000):
+        """
+        Computes the sinusoidal positional encoding 
+        """
+        pe = torch.zeros(position.size(0), d_model)
+        position = position.unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
 # Define the RNN parameters
-num_sequences = 10
-num_shapes = 3
-sequence_length = 10
-hidden_size = 6
-input_size = num_sequences + sequence_length
-output_size = num_shapes
-num_epochs = 100
+num_sequences = 20
+num_shapes = 7
+num_shapes_per_sequence = 10
+sequence_length = 20
+embedding_dim = 16  # Dimension for sequence embeddings
+hidden_size = 20
+num_layers = 1  # number of RNN layers
+num_epochs = 200
+learning_rate = 0.01
+teacher_forcing_ratio = 0.5
 
 env = Environment()
-env.generate_sequences(num_sequences, sequence_length, num_shapes)
+env.generate_sequences(num_sequences, sequence_length, num_shapes, num_shapes_per_sequence)
 
-# Instantiate the RNN
-model = ShapePredictorRNN(input_size, hidden_size, output_size)
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+model = ShapePredictorRNN(num_sequences, embedding_dim, hidden_size, num_shapes, num_layers)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
 # Training loop
 losses = []
 for epoch in range(num_epochs):
     total_loss = 0
-    # Shuffle the order of sequences, but not the positions within sequences
-    sequence_order = np.random.permutation(num_sequences)
-    
-    for seq_idx in sequence_order:
-        hidden = model.init_hidden(1)  # Initialize hidden state for each sequence
+    for seq_idx in range(num_sequences):
+        hidden = None  # Initialize hidden state for each sequence
+        sequence_loss = 0
         for pos in range(sequence_length):
-            # Prepare input: one-hot encoded sequence index + position
-            sequence_onehot = np.zeros(num_sequences)
-            sequence_onehot[seq_idx] = 1
-            position_onehot = np.zeros(sequence_length)
-            position_onehot[pos] = 1
-            
-            input_tensor = torch.tensor(np.concatenate([sequence_onehot, position_onehot])[np.newaxis, np.newaxis, :], dtype=torch.float32)
-            target_tensor = torch.tensor(env.get_shape(seq_idx, pos), dtype=torch.float32)
-
-            # Zero the gradients
-            optimizer.zero_grad()
+            # Prepare input
+            input_seq_idx = torch.tensor([seq_idx]).long()
+            input_pos = torch.tensor([pos], dtype=torch.float32)
 
             # Forward pass
-            output, hidden = model(input_tensor, hidden)
+            output, hidden = model(input_seq_idx, input_pos, hidden)
+
+            # Get target
+            target = torch.tensor([shape_to_int(env.get_shape(seq_idx, pos))])
 
             # Compute the loss
-            loss = criterion(output.squeeze(), target_tensor)
-            total_loss += loss.item()
+            loss = criterion(output, target)
+            sequence_loss += loss
 
-            # Backward pass and optimize
-            loss.backward()
-            optimizer.step()
+            # Teacher forcing 
+            if np.random.random() < teacher_forcing_ratio:
+                input_shape = target
+            else:
+                input_shape = torch.argmax(output, dim=1)
 
-            # Detach hidden state
-            hidden = hidden.detach()
+        # Backward pass and optimize (once per sequence)
+        optimizer.zero_grad()
+        sequence_loss.backward()
+        optimizer.step()
 
-    avg_loss = total_loss / (num_sequences * sequence_length)
+        total_loss += sequence_loss.item()
+
+    avg_loss = total_loss / num_sequences
+
     losses.append(avg_loss)
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
-# Function to calculate prediction error
-def prediction_error(predicted, actual):
-    return np.linalg.norm(predicted - actual)
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
 
 # Testing the RNN
 model.eval()  # Set the model to evaluation mode
@@ -111,21 +138,23 @@ with torch.no_grad():
     errors = []
     for i in range(num_sequences):
         sequence_errors = []
-        hidden = model.init_hidden(1)
+        hidden = None
         for j in range(sequence_length):
-            sequence_onehot = np.zeros(num_sequences)
-            sequence_onehot[i] = 1
-            position_onehot = np.zeros(sequence_length)
-            position_onehot[j] = 1
-            input_tensor = torch.tensor(np.concatenate([sequence_onehot, position_onehot])[np.newaxis, np.newaxis, :], dtype=torch.float32)
-            
-            output, hidden = model(input_tensor, hidden)
+            input_seq_idx = torch.tensor([i]).long()
+            input_pos = torch.tensor([j], dtype=torch.float32)
+
+            output, hidden = model(input_seq_idx, input_pos, hidden)
             predicted = output.numpy().squeeze()
             actual = env.get_shape(i, j)
-            
-            error = prediction_error(predicted, actual)
+
+            _predicted = np.argmax(predicted)
+            _actual = shape_to_int(actual)
+            print(f"Sequence {i}, Position {j}: Predicted: {_predicted}, Actual: {_actual}")
+
+            error = np.sum(np.abs(predicted - actual))
             sequence_errors.append(error)
         errors.append(np.mean(sequence_errors))
+        print()
 
     print(f"Average prediction error: {np.mean(errors):.4f}")
 

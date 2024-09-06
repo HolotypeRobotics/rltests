@@ -2,126 +2,178 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
+import matplotlib.pyplot as plt
+import math
 
-GRID_SIZE = 10
-MAX_STEPS = 200
-HIDDEN_SIZE = 64
-TRAJECTORY_LENGTH = 5
-NUM_SHAPES = 4
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+"""
+This is a basic example of a sequence prediction task using an RNN. 
+The task is to predict the shape at a given position in a sequence of shapes.
+This will be used as a basis for training place cells in a larger model.
+Please note that this is a simplified example and should not include intricate the details of biological place cells.
+It may still show basic properties of place cells, such as grid-like firing fields, or similarities in remapping behaviors.
+"""
 
-class GridEnvironment:
-    def __init__(self, size=GRID_SIZE):
-        self.size = size
-        self.grid = np.zeros((size, size), dtype=int)
-        self.agent_pos = [0, 0]
-        self.place_shapes()
+def shape_to_int(shape):
+    return np.argmax(shape)
 
-    def place_shapes(self):
-        for _ in range(NUM_SHAPES):
-            x, y = np.random.randint(0, self.size), np.random.randint(0, self.size)
-            shape = np.random.randint(1, NUM_SHAPES + 1)
-            self.grid[x, y] = shape
+class Environment:
+    def __init__(self):
+        self.sequences = []
 
-    def step(self, action):
-        # 0: up, 1: right, 2: down, 3: left
-        dx, dy = [(-1, 0), (0, 1), (1, 0), (0, -1)][action]
-        new_x, new_y = self.agent_pos[0] + dx, self.agent_pos[1] + dy
-        if 0 <= new_x < self.size and 0 <= new_y < self.size:
-            self.agent_pos = [new_x, new_y]
-        return self.agent_pos, self.grid[self.agent_pos[0], self.agent_pos[1]]
+    def generate_sequences(self, n_sequences, trajectory_length, n_diff_shapes, n_shapes_per_sequence):
+        for _ in range(n_sequences):
+            sequence = []
+            # Fill the sequence with no shapes
+            for _ in range(trajectory_length):
+                shape = np.zeros(n_diff_shapes)
+                sequence.append(shape)
+            # Add a number of shapes, selecting from n_diff_shapes
+            for _ in range(1, n_shapes_per_sequence):
+                # Select a random position and shape
+                pos = np.random.randint(0, trajectory_length)
+                shape = np.random.randint(0, n_diff_shapes)
+                # Add the shape to the sequence as a 1-hot encoded vector
+                v = np.zeros(n_diff_shapes)
+                v[shape] = 1
+                sequence[pos] = v
+            self.sequences.append(sequence)
 
-class ShapePredictionModel(nn.Module):
-    def __init__(self, trajectory_length, hidden_size, num_shapes):
-        super(ShapePredictionModel, self).__init__()
-        self.lstm = nn.LSTM(2, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_shapes + 1)  # +1 for "no shape"
+    def get_shape(self, sequence, position):
+        return self.sequences[sequence][position]
 
-    def forward(self, trajectory):
-        lstm_out, _ = self.lstm(trajectory)
-        return self.fc(lstm_out[:, -1, :])
 
-class Agent:
-    def __init__(self, model, trajectory_length):
-        self.model = model
-        self.optimizer = optim.Adam(model.parameters())
-        self.trajectory = deque(maxlen=trajectory_length)
-        self.criterion = nn.CrossEntropyLoss()
+class ShapePredictorRNN(nn.Module):
+    def __init__(self, num_sequences, embedding_dim, hidden_size, output_size, num_layers=1):
+        super(ShapePredictorRNN, self).__init__()
+        self.embedding_dim = embedding_dim
+        self.embedding = nn.Embedding(num_sequences, embedding_dim)
+        # self.rnn = nn.GRU(embedding_dim + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.rnn = nn.RNN(embedding_dim + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
 
-    def add_to_trajectory(self, position):
-        self.trajectory.append(position)
+    def forward(self, sequence_idx, position, h=None):
+        embedded_seq = self.embedding(sequence_idx)
+        pos_enc = self.positional_encoding(position, self.embedding_dim)
+        rnn_input = torch.cat((embedded_seq, pos_enc), dim=1).unsqueeze(1)  # Add sequence dimension
+        out, h = self.rnn(rnn_input, h)
+        out = self.fc(out.squeeze(1))  # Remove sequence dimension
+        return out, h
 
-    def predict(self):
-        if len(self.trajectory) < self.trajectory.maxlen:
-            return None
-        with torch.no_grad():
-            trajectory_tensor = torch.tensor(list(self.trajectory), dtype=torch.float32).unsqueeze(0).to(device)
-            prediction = self.model(trajectory_tensor)
-            return torch.softmax(prediction, dim=1).squeeze().cpu().numpy()
+    def positional_encoding(self, position, d_model, max_len=1000):
+        """
+        Computes the sinusoidal positional encoding 
+        """
+        pe = torch.zeros(position.size(0), d_model)
+        position = position.unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * -(math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
-    def learn(self, true_shape):
-        if len(self.trajectory) < self.trajectory.maxlen:
-            return
-        trajectory_tensor = torch.tensor(list(self.trajectory), dtype=torch.float32).unsqueeze(0).to(device)
-        true_shape_tensor = torch.tensor([true_shape], dtype=torch.long).to(device)
+# Define the RNN parameters
+num_sequences = 20
+num_shapes = 7
+num_shapes_per_sequence = 10
+sequence_length = 20
+embedding_dim = 16  # Dimension for sequence embeddings
+hidden_size = 20
+num_layers = 1  # number of RNN layers
+num_epochs = 200
+learning_rate = 0.01
+teacher_forcing_ratio = 0.5
 
-        self.optimizer.zero_grad()
-        prediction = self.model(trajectory_tensor)
-        loss = self.criterion(prediction, true_shape_tensor)
-        loss.backward()
-        self.optimizer.step()
+env = Environment()
+env.generate_sequences(num_sequences, sequence_length, num_shapes, num_shapes_per_sequence)
 
-def train():
-    env = GridEnvironment()
-    model = ShapePredictionModel(TRAJECTORY_LENGTH, HIDDEN_SIZE, NUM_SHAPES).to(device)
-    agent = Agent(model, TRAJECTORY_LENGTH)
+model = ShapePredictorRNN(num_sequences, embedding_dim, hidden_size, num_shapes, num_layers)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    for step in range(MAX_STEPS):
-        action = np.random.randint(0, 4)
-        position, shape = env.step(action)
-        agent.add_to_trajectory(position)
-        agent.learn(shape)
+# Training loop
+losses = []
+for epoch in range(num_epochs):
+    total_loss = 0
+    for seq_idx in range(num_sequences):
+        hidden = None  # Initialize hidden state for each sequence
+        sequence_loss = 0
+        for pos in range(sequence_length):
+            # Prepare input
+            input_seq_idx = torch.tensor([seq_idx]).long()
+            input_pos = torch.tensor([pos], dtype=torch.float32)
 
-        if (step + 1) % 10 == 0:
-            print(f"Step {step + 1}")
+            # Forward pass
+            output, hidden = model(input_seq_idx, input_pos, hidden)
 
-    return agent
+            # Get target
+            target = torch.tensor([shape_to_int(env.get_shape(seq_idx, pos))])
 
-def evaluate(agent, env):
-    predictions = np.zeros((GRID_SIZE, GRID_SIZE, NUM_SHAPES + 1))
-    for x in range(GRID_SIZE):
-        for y in range(GRID_SIZE):
-            agent.trajectory.clear()
-            for _ in range(TRAJECTORY_LENGTH):
-                agent.add_to_trajectory([x, y])
-            prediction = agent.predict()
-            if prediction is not None:
-                predictions[x, y] = prediction
+            # Compute the loss
+            loss = criterion(output, target)
+            sequence_loss += loss
 
-    correct_predictions = 0
-    total_shapes = 0
-    for x in range(GRID_SIZE):
-        for y in range(GRID_SIZE):
-            true_shape = env.grid[x, y]
-            predicted_shape = np.argmax(predictions[x, y])
-            if true_shape > 0:
-                total_shapes += 1
-                if predicted_shape == true_shape:
-                    correct_predictions += 1
+            # Teacher forcing 
+            if np.random.random() < teacher_forcing_ratio:
+                input_shape = target
+            else:
+                input_shape = torch.argmax(output, dim=1)
 
-    accuracy = correct_predictions / total_shapes if total_shapes > 0 else 0
-    print(f"Prediction Accuracy: {accuracy:.2f}")
+        # Backward pass and optimize (once per sequence)
+        optimizer.zero_grad()
+        sequence_loss.backward()
+        optimizer.step()
 
-    return predictions
+        total_loss += sequence_loss.item()
 
-if __name__ == "__main__":
-    trained_agent = train()
-    env = GridEnvironment()  # Create a new environment for evaluation
-    predictions = evaluate(trained_agent, env)
+    avg_loss = total_loss / num_sequences
 
-    print("True Environment:")
-    print(env.grid)
-    print("\nPredicted Environment (most likely shape at each position):")
-    print(np.argmax(predictions, axis=2))
+    losses.append(avg_loss)
+
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
+
+# Testing the RNN
+model.eval()  # Set the model to evaluation mode
+with torch.no_grad():
+    errors = []
+    for i in range(num_sequences):
+        sequence_errors = []
+        hidden = None
+        for j in range(sequence_length):
+            input_seq_idx = torch.tensor([i]).long()
+            input_pos = torch.tensor([j], dtype=torch.float32)
+
+            output, hidden = model(input_seq_idx, input_pos, hidden)
+            predicted = output.numpy().squeeze()
+            actual = env.get_shape(i, j)
+
+            _predicted = np.argmax(predicted)
+            _actual = shape_to_int(actual)
+            print(f"Sequence {i}, Position {j}: Predicted: {_predicted}, Actual: {_actual}")
+
+            error = np.sum(np.abs(predicted - actual))
+            sequence_errors.append(error)
+        errors.append(np.mean(sequence_errors))
+        print()
+
+    print(f"Average prediction error: {np.mean(errors):.4f}")
+
+# Visualize the results
+plt.figure(figsize=(12, 5))
+
+# Plot 1: Training Loss
+plt.subplot(1, 2, 1)
+plt.plot(range(1, num_epochs + 1), losses)
+plt.title('Training Loss Over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+
+# Plot 2: Prediction Errors
+plt.subplot(1, 2, 2)
+plt.bar(range(1, len(errors) + 1), errors)
+plt.title('Prediction Errors by Sequence')
+plt.xlabel('Sequence')
+plt.ylabel('Average Error')
+
+plt.tight_layout()
+plt.show()

@@ -23,31 +23,31 @@ def generate_fourier_features(coords, grid_size):
     features.append(grid_cell(y, 1, grid_size)) # y env grid activation
     return torch.cat(features, dim=1)
 
-def shape_to_int(shape):
-    return np.argmax(shape)
+def place_to_int(place):
+    return np.argmax(place)
 
-def create_unique_environments(num_environments, grid_size, shapes_per_env, n_sequences, path_length):
+def create_unique_environments(num_environments, grid_size, places_per_env, n_sequences, path_length):
     environments = []
-    num_shapes = shapes_per_env * num_environments
-    # Create a list of shapes to pull from
-    shapes = list(range(num_shapes))
-    # Shuffle the shapes
-    np.random.shuffle(shapes)
-    # Divide the shapes into groups for each environment
-    shape_groups = [shapes[i:(i + num_shapes // num_environments)] for i in range(0, num_shapes, num_shapes // num_environments)]
+    num_places = places_per_env * num_environments
+    # Create a list of places to pull from
+    places = list(range(num_places))
+    # Shuffle the places
+    np.random.shuffle(places)
+    # Divide the places into groups for each environment
+    place_groups = [places[i:(i + num_places // num_environments)] for i in range(0, num_places, num_places // num_environments)]
 
     for _ in range(num_environments):
-        env = Environment(grid_size, num_shapes)
+        env = Environment(grid_size, num_places)
         env.generate_paths(n_sequences, path_length)
-        env.place_shapes(shape_groups.pop(0))
+        env.put_places(place_groups.pop(0))
         environments.append(env)
     return environments
 
 class Environment:
-    def __init__(self, grid_size, n_diff_shapes):
+    def __init__(self, grid_size, n_diff_places):
         self.grid_size = grid_size
-        # populate the grid with empty shapes
-        self.grid = np.zeros((grid_size, grid_size, n_diff_shapes))
+        # populate the grid with empty places
+        self.grid = np.zeros((grid_size, grid_size, n_diff_places))
         self.paths = []
 
     def generate_paths(self, n_paths, path_length):
@@ -64,28 +64,28 @@ class Environment:
                 path.append((x, y))
             self.paths.append(path)
 
-    def place_shapes(self, shapes):
-        """Places one of each shape on the grid at locations along the paths."""
+    def put_places(self, places):
+        """puts one of each place on the grid at locations along the paths."""
         all_positions = [pos for path in self.paths for pos in path]
         np.random.shuffle(all_positions)
 
         for pos in all_positions:
-            if not shapes:
+            if not places:
                 break
             x, y = pos
-            if np.sum(self.grid[y, x]) == 0:  # If no shape at this position
-                self.grid[y, x, shapes.pop(0)] = 1 # Creates 1 hot encoding of shape
+            if np.sum(self.grid[y, x]) == 0:  # If no place at this position
+                self.grid[y, x, places.pop(0)] = 1 # Creates 1 hot encoding of place
 
-    def get_shape_at(self, x, y):
-        """Returns the shape at the given (x, y) coordinates."""
+    def get_place_at(self, x, y):
+        """Returns the place at the given (x, y) coordinates."""
         return self.grid[y, x]
 
 
-# --- Shape Predictor RNN (Modified) ---
-class ShapePredictorRNN(nn.Module):
+# --- place Predictor RNN (Modified) ---
+class placePredictorRNN(nn.Module):
 
     def __init__(self, input_size, hidden_size, output_size, grid_size):
-        super(ShapePredictorRNN, self).__init__()
+        super(placePredictorRNN, self).__init__()
         self.input_size = input_size
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size * 2, output_size)
@@ -111,11 +111,11 @@ class ShapePredictorRNN(nn.Module):
     def positional_encoding(self, position):
         return generate_fourier_features(position, self.grid_size)
 
-def visualize_shape_probabilities(model, environments, num_shapes, resolution=100):
+def visualize_place_probabilities(model, environments, num_places, resolution=100):
     model.eval()
     for env_idx, env in enumerate(environments):
         grid_size = env.grid_size
-        probabilities = np.zeros((resolution, resolution, num_shapes))
+        probabilities = np.zeros((resolution, resolution, num_places))
 
         with torch.no_grad():
             for y in range(resolution):
@@ -126,24 +126,24 @@ def visualize_shape_probabilities(model, environments, num_shapes, resolution=10
                     output, _ = model(input_pos)
                     probabilities[y, x, :] = torch.softmax(output, dim=1).numpy().squeeze()
 
-        fig, axes = plt.subplots(2, (num_shapes + 1) // 2, figsize=(20, 10))
+        fig, axes = plt.subplots(2, (num_places + 1) // 2, figsize=(20, 10))
         axes = axes.flatten()
 
-        for shape in range(num_shapes):
-            im = axes[shape].imshow(probabilities[:, :, shape], cmap='viridis', interpolation='nearest', alpha=0.7,
+        for place in range(num_places):
+            im = axes[place].imshow(probabilities[:, :, place], cmap='viridis', interpolation='nearest', alpha=0.7,
                                     extent=[-0.5, grid_size - 0.5, grid_size - 0.5, -0.5])
-            axes[shape].set_title(f'Env: {env_idx}, Shape {shape}')
+            axes[place].set_title(f'Env: {env_idx}, place {place}')
 
-            # Overlay actual shape positions
+            # Overlay actual place positions
             for y in range(grid_size):
                 for x in range(grid_size):
-                    if env.grid[y, x, shape] == 1:
-                        axes[shape].plot(x, y, 'ro', markersize=10, markeredgecolor='white')
+                    if env.grid[y, x, place] == 1:
+                        axes[place].plot(x, y, 'ro', markersize=10, markeredgecolor='white')
 
-            axes[shape].set_xlim(-0.5, grid_size - 0.5)
-            axes[shape].set_ylim(grid_size - 0.5, -0.5)
-            axes[shape].axis('off')
-            fig.colorbar(im, ax=axes[shape])
+            axes[place].set_xlim(-0.5, grid_size - 0.5)
+            axes[place].set_ylim(grid_size - 0.5, -0.5)
+            axes[place].axis('off')
+            fig.colorbar(im, ax=axes[place])
 
     plt.tight_layout()
     plt.show()
@@ -151,19 +151,19 @@ def visualize_shape_probabilities(model, environments, num_shapes, resolution=10
 # --- Model and Training Parameters ---
 num_environments = 1
 num_sequences = 10
-shapes_per_environment = 15
+places_per_environment = 15
 path_length = 20
 grid_size = 10
 hidden_size = 10
 num_epochs = 200
 learning_rate = 0.01
 input_size = 6  # normalized x, normalized y, Fourier x, Fourier y, Fourier x_env, Fourier y_env
-num_shapes = shapes_per_environment * num_environments
+num_places = places_per_environment * num_environments
 
 # --- Create Multiple Environments ---
-environments = create_unique_environments(num_environments, grid_size, shapes_per_environment, num_sequences, path_length)
+environments = create_unique_environments(num_environments, grid_size, places_per_environment, num_sequences, path_length)
 
-model = ShapePredictorRNN(input_size, hidden_size, num_shapes, grid_size)
+model = placePredictorRNN(input_size, hidden_size, num_places, grid_size)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -178,7 +178,7 @@ for epoch in range(num_epochs):
             for (x, y) in path:
                 input_pos = torch.tensor([x, y], dtype=torch.float32).unsqueeze(0)
                 output, hidden = model(input_pos, hidden)
-                target = torch.tensor([shape_to_int(env.get_shape_at(x, y))])
+                target = torch.tensor([place_to_int(env.get_place_at(x, y))])
                 loss = criterion(output, target)
                 sequence_loss += loss
 
@@ -214,7 +214,7 @@ with torch.no_grad():
                 output, hidden = model(input_pos, hidden)
 
                 predicted = torch.argmax(output).item()
-                actual = shape_to_int(env.get_shape_at(x, y))
+                actual = place_to_int(env.get_place_at(x, y))
                 print(f"position x {x}, y {y}: Predicted: {predicted}, Actual: {actual}")
 
                 error = abs(predicted - actual)
@@ -244,4 +244,4 @@ plt.ylabel('Average Error')
 plt.tight_layout()
 plt.show()
 
-visualize_shape_probabilities(model, environments, num_shapes)
+visualize_place_probabilities(model, environments, num_places)

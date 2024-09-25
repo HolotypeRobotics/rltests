@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from environment import Environment
+from tests.environment import Environment
 
 # HP to PL:
 # fine allocentric position
@@ -99,11 +99,11 @@ class TaskPredictor(nn.Module):
 
 class Agent(nn.Module):
     def __init__(self, input_size, hidden_size, action_size, state_size, num_task_sets):
-        super(RLAgent, self).__init__()
+        super(self).__init__()
         
         self.gru = GRUNetwork(input_size, hidden_size)
         self.actor = ActorNetwork(hidden_size, action_size)
-        self.critic = CriticNetwork(hidden_size)\
+        self.critic = CriticNetwork(hidden_size)
         self.effort_net = EffortNetwork(hidden_size)
         self.state_predictor = StatePredictorNetwork(hidden_size, state_size)
         self.task_predictor = TaskPredictor(hidden_size, num_task_sets=4)
@@ -111,6 +111,7 @@ class Agent(nn.Module):
 
     def switch_task_set():
         # switch out the weights in the current GRU with the next best one
+        pass
 
     def task_switch_needed():
         # The need for a task switch is weighed based on the amount of errors from the current task set,

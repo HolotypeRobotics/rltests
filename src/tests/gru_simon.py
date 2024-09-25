@@ -5,8 +5,8 @@ import numpy as np
 
 class GRUCell:
     def __init__(self, input_size, hidden_size):
+        self.input_size = input_size
         self.hidden_size = hidden_size
-
         # W: Weight matrices for input connections
         # U: Weight matrices for recurrent connections
         # b: Bias vectors
@@ -45,6 +45,22 @@ class GRUCell:
         # Reshape input
         x = x.reshape(-1, 1)
 
+
+       # input weights for canidate hidden state
+        self.W_h.fill(0)
+        # input weights for update gate
+        self.W_z.fill(0)
+        # input weights for reset gate
+        self.W_r.fill(0)
+
+        # recurrent weights for canidate hidden state
+        self.U_h.fill(0)
+        # recurrent weights for update gate
+        self.U_z.fill(0)
+        # recurrent weights for reset gate
+        self.U_r.fill(0)
+
+
         # Update gate
         z = self.sigmoid(np.dot(self.W_z, x) + np.dot(self.U_z, self.h) + self.b_z)
 
@@ -56,6 +72,7 @@ class GRUCell:
 
         # New hidden state
         self.h = (1 - z) * self.h + z * h_hat
+        print(f"z: {z}, r: {r}, h_hat: {h_hat}, h: {self.h}")
 
         return self.h
 
@@ -75,6 +92,7 @@ class GRUModel:
     def predict(self, x):
         h = self.gru.forward(x)
         out = np.dot(self.W_out, h) + self.b_out
+        print(f"out weights: {self.W_out}")
         return self.softmax(out)
 
     def softmax(self, x):
@@ -111,7 +129,7 @@ color_to_index = {color: i for i, color in enumerate(colors)}
 index_to_color = {i: color for i, color in enumerate(colors)}
 
 input_size = len(colors)
-hidden_size = 10
+hidden_size = 1
 output_size = len(colors)
 
 model = GRUModel(input_size, hidden_size, output_size)
@@ -132,6 +150,7 @@ try:
 
         # Make a prediction
         y_pred = model.predict(x)
+        print(f"Prediction: {y_pred}")
         predicted_color = index_to_color[np.argmax(y_pred)]
 
         print(f"Model predicts the next color will be: {predicted_color}")

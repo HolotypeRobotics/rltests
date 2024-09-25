@@ -1,5 +1,5 @@
 import numpy as np
-from environment import Environment
+from tests.environment import Environment
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

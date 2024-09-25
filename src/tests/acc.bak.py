@@ -77,7 +77,6 @@ class ACCModel:
         dynamic_effort = effort * (1 + fatigue * (1 - recent_performance))
         return self.subjective_value(reward, dynamic_effort)
 
-
     def action_outcome_contingency(self, p_outcome_given_action, p_outcome_given_no_action):
         """Compute action-outcome contingency"""
         return p_outcome_given_action - p_outcome_given_no_action
@@ -133,7 +132,6 @@ class ACCModel:
         """Compute the relevance of a task set to the current context based on feature overlap"""
         feature_overlap = np.dot(task_set, context)  # Assuming task_set and context are feature vectors
         return feature_overlap / (np.linalg.norm(task_set) * np.linalg.norm(context))
-
 
     def compute_historical_performance(self, task_set, performance_history):
         """Compute the historical performance of a task set"""

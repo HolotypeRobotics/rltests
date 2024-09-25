@@ -87,6 +87,7 @@ class Agent:
         self.hunger = np.random.uniform(*config['agent']['hunger_range'])
         self.target_sensitivities = config['agent']['target_sensitivities']
 
+# TODO: Add encoding for recent position
 def dca1_activation(x, y, environment, config):
     """Fine allocentric place using overlapping grids of increasing resolution."""
     activations = []

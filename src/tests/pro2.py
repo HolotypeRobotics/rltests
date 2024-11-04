@@ -22,49 +22,38 @@ class PROModel:
         
         # Add missing inhibition initialization
         np.fill_diagonal(self.W_I, -1)  # Self-inhibition
-```
 
-## 2. Response Activation Computation
-
-```python
-def compute_response_activation(self, stimuli, S, omega_P, omega_N):
-    # Current implementation needs modification for proper gating
-    
-    # Should be:
     def compute_response_activation(self, stimuli, S, omega_P, omega_N):
-        # Compute proactive control signal
-        proactive = np.dot(self.W_F, S)
-        
-        # Compute reactive control signal
-        reactive = (np.dot(self.W_omega_P, omega_P) + 
-                   np.dot(self.W_omega_N, omega_N))
-        
-        # Compute direct pathway activation
-        direct = np.dot(self.W_C, stimuli)
-        
-        # Compute noise
-        noise = np.random.normal(0, self.noise_sigma, self.n_responses)
-        
-        # Total control signal
-        control = proactive + reactive
-        
-        # Response dynamics with gating
-        E = self.rho * (direct * (1 - np.maximum(0, control)))
-        I = self.psi * np.maximum(0, control)
-        
-        delta_C = self.beta * self.dt * (
-            E * (1 - self.C) - 
-            I * self.C + 
-            noise
-        )
-        
-        self.C = np.clip(self.C + delta_C, 0, 1)
-        return self.C
-```
 
-## 3. Learning Updates
+        def compute_response_activation(self, stimuli, S, omega_P, omega_N):
+            # Compute proactive control signal
+            proactive = np.dot(self.W_F, S)
+            
+            # Compute reactive control signal
+            reactive = (np.dot(self.W_omega_P, omega_P) + 
+                    np.dot(self.W_omega_N, omega_N))
+            
+            # Compute direct pathway activation
+            direct = np.dot(self.W_C, stimuli)
+            
+            # Compute noise
+            noise = np.random.normal(0, self.noise_sigma, self.n_responses)
+            
+            # Total control signal
+            control = proactive + reactive
+            
+            # Response dynamics with gating
+            E = self.rho * (direct * (1 - np.maximum(0, control)))
+            I = self.psi * np.maximum(0, control)
+            
+            delta_C = self.beta * self.dt * (
+                E * (1 - self.C) - 
+                I * self.C + 
+                noise
+            )
+            
+            self.C = np.clip(self.C + delta_C, 0, 1)
 
-```python
 def update_temporal_prediction_weights(self, X, r_t, V_t, V_tp1):
     # Add eligibility trace decay
     lambda_decay = 0.9  # Eligibility trace decay parameter

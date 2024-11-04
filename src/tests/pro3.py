@@ -13,6 +13,7 @@ class PROModel:
                 alpha=0.1,
                 beta=0.1,
                 gamma=0.95,
+                lambda_decay=0.95,
                 psi=0.1,
                 phi=0.1,
                 rho=0.1,
@@ -24,21 +25,28 @@ class PROModel:
         self.gamma = gamma  # Temporal discount parameter
         self.alpha = alpha  # Base learning rate
         self.n_timesteps = n_timesteps  # Length of the tapped delay chain
-        
+        self.lambda_decay = lambda_decay  # Eligibility trace decay factor
+
         # Dimensions
         self.n_stimuli = n_stimuli
-        self.n_responses = n_responses
+        self.n_responses= n_responses
         self.n_outcomes = n_outcomes
         
         # Initialize weights
-        self.W_S = np.abs(np.random.normal(0.1, 0.05, (n_outcomes, n_stimuli)))
-        self.W_C = np.random.full((n_responses, n_stimuli), 1)  # Stimulus to response weights (Non-learning)
-        self.W_F = -np.abs(np.random.normal(0.1, 0.05, (n_responses, n_outcomes)))
-        self.W_I = np.zeros((n_responses, n_responses))  # Response inhibition weights
+        self.W_S = np.abs(np.random.normal(0.1, 0.05, (n_outcomes, n_stimuli))) # Response Output conjunction weights
+        self.W_C = np.full((n_responses, n_stimuli), 1)  # Stimulus to response weights (Non-learning)
+        self.W_F = -np.abs(np.random.normal(0, 0.1, (n_outcomes, n_responses))) # Learned top-down control from R-O units to Response units
+        self.W_I = np.zeros((n_responses, n_responses))  # Fixed Mutual inhibition weights between response units
         np.fill_diagonal(self.W_I, -1)  # Self-inhibition
         self.U = np.zeros((n_outcomes, n_stimuli, n_timesteps))  # Temporal prediction weights (100 time steps)
+        self.eligibility_trace = np.zeros_like(self.U)
         
-        
+        # Normalize WF weights as specified in the paper
+        # Sum of absolute values should not exceed number of R-O conjunctions
+        norm_factor = np.sum(np.abs(self.W_F)) / (n_responses * n_outcomes)
+        if norm_factor > 1:
+            self.W_F /= norm_factor
+
         # Response parameters
         self.beta = beta  # Response gain
         self.noise_sigma = noise_sigma # Response noise
@@ -64,7 +72,6 @@ class PROModel:
         return self.A
 
 
-# Eq 6
     def compute_outcome_prediction(self, stimuli):
         """Compute immediate outcome predictions (S) based on current stimuli"""
         return np.dot(self.W_S, stimuli)
@@ -88,8 +95,8 @@ class PROModel:
         n_timesteps = min(X.shape[1], self.U.shape[2])
         X_padded = np.pad(X, ((0, 0), (0, self.U.shape[2] - X.shape[1])), mode='constant')
 
-        self.V = np.sum(np.dot(self.U, X_padded), axis=1)
-        # self.V = np.sum(np.sum(self.U * X_padded[None, :, :], axis=1), axis=1)
+        # self.V = np.sum(np.dot(self.U, X_padded), axis=1)
+        self.V = np.sum(np.sum(self.U * X_padded[None, :, :], axis=1), axis=1)
         
         return self.V
 
@@ -98,33 +105,43 @@ class PROModel:
         self.TD_error = r_t + self.gamma * V_tp1 - V_t
         return self.TD_error
 
-# x
     def compute_surprise(self, predicted, actual):
         """Compute positive and negative surprise"""
         omega_P = np.maximum(0, actual - predicted)  # Unexpected occurrences
         omega_N = np.maximum(0, predicted - actual)  # Unexpected non-occurrences
         return omega_P, omega_N
 
-
     def update_temporal_prediction_weights(self, X, r_t, V_t, V_tp1):
         """Update temporal prediction weights based on TD error"""
         # Calculate prediction error
+        print(f"Vt:{V_t}, Vt+1{V_tp1}, r_t: {r_t}")
         delta = self.compute_prediction_error(V_t, V_tp1, r_t)
         if X.ndim == 1:
             X = X[:, None]
-        
-        # Apply eligibility trace for weight updates without recursion
-        eligibility_trace = np.zeros_like(self.U)
+
+        # Decay the eligibility trace
+        self.eligibility_trace *= self.gamma * self.lambda_decay
 
         # Iterate over the dimensions of `X` for weight updates
+        # j: specific time delay unit
+        # k: particular task-related stimulus or imput feature being tracked over time
         for i in range(self.n_outcomes):
             for j in range(self.n_stimuli):
                 # Use the current stimulus (X[j, 0]) for the eligibility trace
                 if X[j, 0] > 0:
-                    eligibility_trace[i, j, :] = np.roll(eligibility_trace[i, j, :], 1)
-                    eligibility_trace[i, j, 0] = X[j, 0]
-                    self.U[i, j, :] += self.alpha * delta[i] * eligibility_trace[i, j, :]
+                    # print(f"e{self.eligibility_trace}")
+                    # print(f"----------------")
+                    self.eligibility_trace[i, j, :] = np.roll(self.eligibility_trace[i, j, :], 1)
+                    # print(f"e{self.eligibility_trace}")
+                    # print(f"----------------")
+                    self.eligibility_trace[i, j, 0] = X[j, 0]
+                    # print(f"e{self.eligibility_trace}")
+                    # print(f"----------------")
 
+                    self.U += self.alpha * delta[i:, None, None] * self.eligibility_trace
+                    print(f"Delta: {delta}")
+                    # print(f"U{self.U}")
+                    # input()
 
 class PROControlModel(PROModel):
     def __init__(self,
@@ -136,6 +153,7 @@ class PROControlModel(PROModel):
                 alpha=0.1,
                 beta=0.1,
                 gamma=0.95,
+                lambda_decay=0.95,
                 psi=0.1,
                 phi=0.1,
                 rho=0.1,
@@ -149,6 +167,7 @@ class PROControlModel(PROModel):
             n_timesteps=n_timesteps,
             dt=dt,
             gamma=gamma,
+            lambda_decay=lambda_decay,
             alpha=alpha,
             beta=beta,
             noise_sigma=noise_sigma,
@@ -158,14 +177,15 @@ class PROControlModel(PROModel):
             rho=rho
         )
         
-        # Additional weights for reactive control
+        # Extra values for tracking/visualization
+        # Surprise vectors for each outcome
+        self.omega_P = np.zeros((n_outcomes))  # Positive surprise
+        self.omega_N = np.zeros((n_outcomes))  # Negative surprise
+
+        # Weights from surprise to response weights
         self.W_omega_P = np.random.normal(0, 0.1, (n_responses, n_outcomes))  # Positive surprise to response weights
         self.W_omega_N = np.random.normal(0, 0.1, (n_responses, n_outcomes))  # Negative surprise to response weights
         
-        # Extra values for tracking/visualization
-        self.omega_P = np.zeros((n_responses, n_outcomes))  # Positive surprise to response weights
-        self.omega_N = np.zeros((n_responses, n_outcomes))  # Negative surprise to response weights
-
     def update_outcome_weights(self, stimuli, outcomes, subjective_badness):
         """Update outcome prediction weights with value modulation"""
         theta = subjective_badness
@@ -179,48 +199,114 @@ class PROControlModel(PROModel):
         delta = A * (theta * outcomes - S)
         self.W_S += np.outer(delta, stimuli)
 
-# Eq 9
-    def compute_response_activation(self, stimuli, S, omega_P, omega_N):
-        """Compute response activation with both proactive and reactive control"""
-    
-        if not all(dim.shape[0] == expected for dim, expected in 
-                zip([stimuli, S, omega_P, omega_N], 
-                    [self.n_stimuli, self.n_outcomes, self.n_outcomes, self.n_outcomes])):
-            raise ValueError("Input dimension mismatch")
-            
-        reactive_control = (np.sum(self.W_omega_P[:, omega_P > 0], axis=1) + 
-                        np.sum(self.W_omega_N[:, omega_N > 0], axis=1))
+    def rectify(self, x):
+        """Implement the [x]+ rectification function"""
+        return np.maximum(0, x)
+
+    def calculate_excitation(self, D, S):
+        """
+        Calculate excitation (Equation 2)
+        
+        Parameters:
+        D: Controller unit activations
+        S: Stimulus unit activations
+        
+        Returns:
+        E: Excitation values for each response unit
+        """
+        # Direct S-R associations
+        direct_term = np.dot(D, self.W_C)
+        print(f"Direct term: {direct_term}")
+        
+        # Proactive control
+        proactive_term = np.sum(self.rectify(-np.dot(S, self.W_F)))
+        print(f"Proactive term: {proactive_term}")
+
+        # Reactive control
+        reactive_term = np.sum(self.rectify(-self.W_omega_N), axis=1)
+        print(f"Reactive term: {reactive_term}")
+        
+        # Combine terms with scaling
+        E = self.rho * (direct_term + proactive_term + reactive_term)
+        print(f"Excitation: {E}")
+        
+        return E
+
+    def calculate_inhibition(self, C, S):
+        """
+        Calculate inhibition (Equation 3)
+        
+        Parameters:
+        C: Controller unit activations for inhibition
+        S: Stimulus unit activations
+        
+        Returns:
+        I: Inhibition values for each response unit
+        """
+        # Direct inhibition
+        direct_inhib = self.psi * np.dot(C, self.W_I)
+        print(f"Direct inhibition: {direct_inhib}")
+        
+        # Proactive control inhibition
+        proactive_inhib = np.sum(self.rectify(np.dot(S, self.W_F)), axis=0)
+        print(f"Proactive inhibition: {proactive_inhib}")
+        
+        # Reactive control inhibition
+        reactive_inhib = np.sum(self.rectify(self.W_omega_N), axis=1)
+        print(f"Reactive inhibition: {reactive_inhib}")
+        
+        # Combine control terms with scaling
+        control_inhib = self.phi * (proactive_inhib + reactive_inhib)
+        print(f"Control inhibition: {control_inhib}")
+        
+        # Total inhibition
+        I = direct_inhib + control_inhib
+        print(f"Total inhibition: {I}")
+
+        return I
+
+    def compute_response_activation(self, stimuli, C, ro_conjuction):
+        """
+        Calculate the final response activation by combining excitation and inhibition
+        
+        Parameters:
+        D: Controller unit activations for excitation
+        C: Controller unit activations for inhibition
+        S: Stimulus unit activations
+        
+        Returns:
+        activation: Final activation values for each response unit
+        """
+        E = self.calculate_excitation(stimuli, ro_conjuction)
+        I = self.calculate_inhibition(C, ro_conjuction)
         
         noise = np.random.normal(0, self.noise_sigma, self.n_responses)
-        
-        E = self.rho * (np.dot(self.W_C, stimuli) - np.maximum(0, np.dot(self.W_F, S)))
-        I = self.psi * (np.maximum(0, np.dot(self.W_F, S)) + np.maximum(0, reactive_control))
+        delta_C = self.beta * self.dt * (E * (1 - C) - (C + 0.05) * (I + 1) + noise)
+        self.C = np.clip(C + delta_C, 0, 1)
 
+        # Diagnostic prints (optional, but helpful for debugging)
         print("\nResponse activation components:")
         print(f"Stimuli: {stimuli}")
-        print(f"E (excitation): {E}")
-        print(f"I (inhibition): {I}")
         print(f"Noise: {noise}")
-        
-        delta_C = self.beta * self.dt * (E * (1 - self.C) - (self.C + 0.05) * (I + 1) + noise)
-        self.C = np.clip(self.C + delta_C, 0, 1)  # Ensure responses stay in [0,1]
-        return self.C
+        print(f"Response: {C}")
     
-    def update_reactive_control(self, response, omega_P, omega_N, outcome_valence):
-        """Update reactive control weights based on both positive and negative surprise"""
-        for i in range(self.n_responses):
-            if response[i] > self.response_threshold:
-                self.W_omega_P[i] = 0.25 * (self.W_omega_P[i] + outcome_valence * omega_P)
-                self.W_omega_N[i] = 0.25 * (self.W_omega_N[i] + outcome_valence * omega_N)
-                # Constrain weights to [-1, 1]
-                self.W_omega_P[i] = np.clip(self.W_omega_P[i], -1, 1)
-                self.W_omega_N[i] = np.clip(self.W_omega_N[i], -1, 1)
+        return C
 
-                # Update W_F based on observed outcomes and responses
-        for i in range(self.n_responses):
-            if response[i] > self.response_threshold:
-                for k in range(self.n_outcomes):
-                    self.W_F[i, k] = 0.01 * (self.W_F[i, k] + response[i] * outcome_valence * outcomes[k])
+    def update_proactive_WF(self, response, outcomes, outcome_valence, learning=True):
+        """Update W_F (proactive component)"""
+        if learning:
+            for i in range(self.n_responses):
+                if response[i] > self.response_threshold:  # T_i,t
+                    for k in range(self.n_outcomes):
+                        self.W_F[i, k] += 0.01 * response[i] * outcomes[k] * outcome_valence
+        
+    def update_reactive_control(self, response, omega_N, outcome_valence):
+        """Update reactive control weights based on both positive and negative surprise"""
+        executed_responses = (response > self.response_threshold).astype(float)        
+        T = executed_responses.reshape(-1, 1)
+        omega = omega_N.reshape(1, -1)
+        self.W_omega_N = 0.25 * (self.W_omega_N + outcome_valence * T * omega)
+        self.W_omega_N = np.clip(self.W_omega_N, -1, 1)
 
 
 def update_models(pro_control_model, stimulus, correct_response, 
@@ -252,13 +338,23 @@ def update_models(pro_control_model, stimulus, correct_response,
 
     # Update reactive control with stronger learning signal
     outcome_valence = 1.0 if is_correct else -0.5  # Stronger punishment for errors
-    pro_control_model.update_reactive_control(response_made, omega_P, omega_N, outcome_valence)
+    pro_control_model.update_reactive_control(response_made, omega_N, outcome_valence)
     
+    # Update proactive component with stronger learning signal
+    pro_control_model.update_proactive_WF(response_made, pro_control_outcome, outcome_valence)
+
     # Update temporal predictions with actual next state
     if next_stimulus is not None:
         V_t = pro_control_model.compute_temporal_prediction(stimulus)
         V_tp1 = pro_control_model.compute_temporal_prediction(next_stimulus)
-        r_t = float(is_correct)  # Use correctness as reward signal
+    
+        # Calculate the reward signal
+        if is_correct:
+            r_t = 1.0  # Reward for correct response
+        else:
+            r_t = -0.5  # Penalty for incorrect response (adjust as needed)
+        
+        # Update temporal predictions with reward
         pro_control_model.update_temporal_prediction_weights(stimulus, r_t, V_t, V_tp1)
 
 def create_change_signal_task(n_trials=100, change_prob=0.4):
@@ -307,7 +403,7 @@ def simulate_trial(model, stimulus, max_steps=100):
     # Monitor response accumulation
     for step in range(max_steps):
         old_C = model.C.copy()
-        response = model.compute_response_activation(stimulus, S, omega_P, omega_N)
+        response = model.compute_response_activation(stimulus, old_C, S)
         
         if step % 10 == 0:  # Print every 10 steps
             print(f"\nStep {step}:")
@@ -334,12 +430,13 @@ def diagnostic_pro_control_model():
         dt=0.05,     # Time step
         alpha=0.073, # Initial learning rate
         gamma=0.9, # Temporal discount
+        lambda_decay=0.999, # Decay rate for eligibility traces
         beta=15.0,  # Response gain
         noise_sigma=0.002, # Response noise
-        response_threshold=0.17, # Response threshold
-        psi=1.2,  # Inhibition scaling
+        response_threshold=0.34, # Response threshold
+        psi=0.95,  # Inhibition scaling
         phi=1.0,  # Control signal scaling
-        rho=1.5   # Excitation scaling
+        rho=0.5   # Excitation scaling
         )
     
     # Print initial weights

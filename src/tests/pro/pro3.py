@@ -31,11 +31,12 @@ class PROModel:
         self.n_stimuli = n_stimuli
         self.n_responses= n_responses
         self.n_outcomes = n_outcomes
+        self.n_ro_conjunctions = n_responses * n_outcomes  # Number of response-outcome combinations
         
         # Initialize weights
-        self.W_S = np.abs(np.random.normal(0.1, 0.05, (n_outcomes, n_stimuli))) # Response Output conjunction weights
+        self.W_S = np.abs(np.random.normal(0.1, 0.05, (self.n_ro_conjunctions, n_stimuli))) # Response Output conjunction weights
         self.W_C = np.full((n_responses, n_stimuli), 1)  # Stimulus to response weights (Non-learning)
-        self.W_F = -np.abs(np.random.normal(0, 0.1, (n_outcomes, n_responses))) # Learned top-down control from R-O units to Response units
+        self.W_F = -np.abs(np.random.normal(0, 0.1, (self.n_ro_conjunctions, n_responses))) # Learned top-down control from R-O units to Response units
         self.W_I = np.zeros((n_responses, n_responses))  # Fixed Mutual inhibition weights between response units
         np.fill_diagonal(self.W_I, -1)  # Self-inhibition
         self.U = np.zeros((n_outcomes, n_stimuli, n_timesteps))  # Temporal prediction weights (100 time steps)
@@ -61,9 +62,8 @@ class PROModel:
         self.C = np.zeros(n_responses)  # Responses
         self.A = self.alpha  # Effective learning rate
 
-        # Extra for recording/visualization
-        self.TD_error = np.zeros(n_responses)  # TD error
-        self.V = np.zeros(n_responses)  # Responses
+        self.TD_error = np.zeros(n_outcomes)  # TD error
+        self.V = np.zeros(n_outcomes)  # Value predictions
 
 
     def update_learning_rate(self, omega_P, omega_N):
@@ -95,8 +95,7 @@ class PROModel:
         n_timesteps = min(X.shape[1], self.U.shape[2])
         X_padded = np.pad(X, ((0, 0), (0, self.U.shape[2] - X.shape[1])), mode='constant')
 
-        # self.V = np.sum(np.dot(self.U, X_padded), axis=1)
-        self.V = np.sum(np.sum(self.U * X_padded[None, :, :], axis=1), axis=1)
+        self.V = np.einsum('ijk,jk->i', self.U, X)
         
         return self.V
 
@@ -111,37 +110,54 @@ class PROModel:
         omega_N = np.maximum(0, predicted - actual)  # Unexpected non-occurrences
         return omega_P, omega_N
 
+    # def update_temporal_prediction_weights(self, X, r_t, V_t, V_tp1):
+    #     """Update temporal prediction weights based on TD error"""
+    #     # Calculate prediction error
+    #     print(f"Vt:{V_t}, Vt+1{V_tp1}, r_t: {r_t}")
+    #     delta = self.compute_prediction_error(V_t, V_tp1, r_t)
+    #     if X.ndim == 1:
+    #         X = X[:, None]
+
+    #     # Decay the eligibility trace
+    #     self.eligibility_trace *= self.gamma * self.lambda_decay
+
+    #     # Iterate over the dimensions of `X` for weight updates
+    #     # j: specific time delay unit
+    #     # k: particular task-related stimulus or imput feature being tracked over time
+    #     for i in range(self.n_outcomes):
+    #         for j in range(self.n_stimuli):
+    #             # Use the current stimulus (X[j, 0]) for the eligibility trace
+    #             if X[j, 0] > 0:
+    #                 # print(f"e{self.eligibility_trace}")
+    #                 # print(f"----------------")
+    #                 self.eligibility_trace[i, j, :] = np.roll(self.eligibility_trace[i, j, :], 1)
+    #                 # print(f"e{self.eligibility_trace}")
+    #                 # print(f"----------------")
+    #                 self.eligibility_trace[i, j, 0] = X[j, 0]
+    #                 # print(f"e{self.eligibility_trace}")
+    #                 # print(f"----------------")
+
+    #                 self.U += self.alpha * delta[i:, None, None] * self.eligibility_trace
+    #                 print(f"Delta: {delta}")
+    #                 # print(f"U{self.U}")
+    #                 # input()
+
     def update_temporal_prediction_weights(self, X, r_t, V_t, V_tp1):
         """Update temporal prediction weights based on TD error"""
-        # Calculate prediction error
-        print(f"Vt:{V_t}, Vt+1{V_tp1}, r_t: {r_t}")
         delta = self.compute_prediction_error(V_t, V_tp1, r_t)
+
         if X.ndim == 1:
             X = X[:, None]
-
+        X_padded = np.pad(X, ((0, 0), (0, self.U.shape[2] - X.shape[1])), mode='constant')
+        
         # Decay the eligibility trace
         self.eligibility_trace *= self.gamma * self.lambda_decay
 
-        # Iterate over the dimensions of `X` for weight updates
-        # j: specific time delay unit
-        # k: particular task-related stimulus or imput feature being tracked over time
-        for i in range(self.n_outcomes):
-            for j in range(self.n_stimuli):
-                # Use the current stimulus (X[j, 0]) for the eligibility trace
-                if X[j, 0] > 0:
-                    # print(f"e{self.eligibility_trace}")
-                    # print(f"----------------")
-                    self.eligibility_trace[i, j, :] = np.roll(self.eligibility_trace[i, j, :], 1)
-                    # print(f"e{self.eligibility_trace}")
-                    # print(f"----------------")
-                    self.eligibility_trace[i, j, 0] = X[j, 0]
-                    # print(f"e{self.eligibility_trace}")
-                    # print(f"----------------")
-
-                    self.U += self.alpha * delta[i:, None, None] * self.eligibility_trace
-                    print(f"Delta: {delta}")
-                    # print(f"U{self.U}")
-                    # input()
+        # Update eligibility trace and weights efficiently using broadcasting
+        self.eligibility_trace = np.roll(self.eligibility_trace, 1, axis=2)
+        self.eligibility_trace[:, :, 0] = X
+        self.U += self.alpha * delta[:, None, None] * self.eligibility_trace
+        
 
 class PROControlModel(PROModel):
     def __init__(self,
@@ -183,8 +199,8 @@ class PROControlModel(PROModel):
         self.omega_N = np.zeros((n_outcomes))  # Negative surprise
 
         # Weights from surprise to response weights
-        self.W_omega_P = np.random.normal(0, 0.1, (n_responses, n_outcomes))  # Positive surprise to response weights
-        self.W_omega_N = np.random.normal(0, 0.1, (n_responses, n_outcomes))  # Negative surprise to response weights
+        self.W_omega_P = np.random.normal(0, 0.1, (n_responses, self.n_ro_conjunctions))  # Positive surprise to response weights
+        self.W_omega_N = np.random.normal(0, 0.1, (n_responses, self.n_ro_conjunctions))  # Negative surprise to response weights
         
     def update_outcome_weights(self, stimuli, outcomes, subjective_badness):
         """Update outcome prediction weights with value modulation"""
@@ -223,9 +239,11 @@ class PROControlModel(PROModel):
         print(f"Proactive term: {proactive_term}")
 
         # Reactive control
-        reactive_term = np.sum(self.rectify(-self.W_omega_N), axis=1)
-        print(f"Reactive term: {reactive_term}")
-        
+        # reactive_term = np.sum(self.rectify(-self.W_omega_N), axis=1)
+        # print(f"Reactive term: {reactive_term}")
+        # Corrected reactive term calculation
+        reactive_term = -self.rectify(np.dot(S, self.W_omega_N.T))  # Apply weights to each outcome
+
         # Combine terms with scaling
         E = self.rho * (direct_term + proactive_term + reactive_term)
         print(f"Excitation: {E}")
@@ -248,11 +266,13 @@ class PROControlModel(PROModel):
         print(f"Direct inhibition: {direct_inhib}")
         
         # Proactive control inhibition
-        proactive_inhib = np.sum(self.rectify(np.dot(S, self.W_F)), axis=0)
+        proactive_inhib = self.rectify(np.sum(np.dot(S, self.W_F)))
         print(f"Proactive inhibition: {proactive_inhib}")
         
         # Reactive control inhibition
-        reactive_inhib = np.sum(self.rectify(self.W_omega_N), axis=1)
+        # reactive_inhib = np.sum(self.rectify(self.W_omega_N), axis=1)
+        # Corrected reactive term calculation
+        reactive_inhib = self.rectify(np.dot(S, self.W_omega_N.T)) # Apply weights to each outcome
         print(f"Reactive inhibition: {reactive_inhib}")
         
         # Combine control terms with scaling
@@ -290,7 +310,7 @@ class PROControlModel(PROModel):
         print(f"Noise: {noise}")
         print(f"Response: {C}")
     
-        return C
+        return self.C
 
     def update_proactive_WF(self, response, outcomes, outcome_valence, learning=True):
         """Update W_F (proactive component)"""
@@ -315,17 +335,20 @@ def update_models(pro_control_model, stimulus, correct_response,
     Update models based on trial outcomes with improved learning signals
     """
     # Convert binary correct_response to outcome vector
-    pro_control_outcome = np.zeros(pro_control_model.n_outcomes)
+    pro_control_outcome = np.zeros(pro_control_model.n_outcomes * pro_control_model.n_responses)
     
     # Determine if response was correct
     response_made = pro_control_response > pro_control_model.response_threshold
     is_correct = np.array_equal(response_made, correct_response)
-    
+    print(f"is correct: {is_correct}")
+    print(f"pro control outcome: {pro_control_outcome}")
     # Set appropriate outcome signals
-    if response_made[0]:    # Go response
+    if response_made[0]:    # If there was a Go response
+        print("response made 0")
         pro_control_outcome[0] = float(is_correct)  # Go correct
         pro_control_outcome[1] = float(not is_correct)  # Go error
-    elif response_made[1]:  # Change response
+    elif response_made[1]:  # if there was a Change response
+        print("response made 1")
         pro_control_outcome[2] = float(is_correct)  # Change correct
         pro_control_outcome[3] = float(not is_correct)  # Change error
     
@@ -385,7 +408,7 @@ def create_change_signal_task(n_trials=100, change_prob=0.4):
     
     return stimuli, correct_responses
 
-def simulate_trial(model, stimulus, max_steps=100):
+def simulate_trial(model, stimulus, max_steps):
     """Debugging version of trial simulation"""
     model.C = np.zeros(model.n_responses)
     
@@ -427,16 +450,16 @@ def diagnostic_pro_control_model():
     model = PROControlModel(n_stimuli=2,
         n_responses=2,
         n_outcomes=2,
-        dt=0.05,     # Time step
-        alpha=0.073, # Initial learning rate
+        dt=1,     # Time step
+        alpha=0.05, # Initial learning rate
         gamma=0.9, # Temporal discount
         lambda_decay=0.999, # Decay rate for eligibility traces
-        beta=15.0,  # Response gain
+        beta=1.0,  # Response gain
         noise_sigma=0.002, # Response noise
-        response_threshold=0.34, # Response threshold
-        psi=0.95,  # Inhibition scaling
+        response_threshold=0.36, # Response threshold
+        psi=0.99,  # Inhibition scaling
         phi=1.0,  # Control signal scaling
-        rho=0.5   # Excitation scaling
+        rho=0.35   # Excitation scaling
         )
     
     # Print initial weights
@@ -451,7 +474,8 @@ def diagnostic_pro_control_model():
 
 def run_change_signal_simulation():
     """Run simulation with diagnostics"""
-    n_trials = 200
+    n_trials = 500
+    steps_per_trial = 10
     
     # Create task
     stimuli, correct_responses = create_change_signal_task(n_trials, change_prob=0.3)
@@ -467,18 +491,19 @@ def run_change_signal_simulation():
     learning_rate =         np.zeros(n_trials)
     omega_P_values =        np.zeros(n_trials)
     omega_N_values =        np.zeros(n_trials)
-    response_activations = []
+    responses =             np.zeros(n_trials)
+    responses_got_correct = np.zeros(n_trials)
     W_S_changes =           np.zeros(n_trials)
     W_C_changes =           np.zeros(n_trials)
     W_F_changes =           np.zeros(n_trials)
     
     # Run first few trials with detailed monitoring
-    for trial in range(min(3, n_trials)):
+    for trial in range(min(5, n_trials)):
         print(f"\n=== Trial {trial + 1} ===")
         print(f"Stimulus: {stimuli[trial]}")
         print(f"Correct response: {correct_responses[trial]}")
-        
-        response, rt = simulate_trial(model, stimuli[trial])
+
+        response, rt = simulate_trial(model, stimuli[trial], steps_per_trial)
         response_made = response > model.response_threshold
         
         print(f"Response made: {response_made}")
@@ -506,10 +531,11 @@ def run_change_signal_simulation():
     # Continue with remaining trials
     for trial in range(5, n_trials):
         # Run trial
-        response, rt = simulate_trial(model, stimuli[trial])
+        response, rt = simulate_trial(model, stimuli[trial], steps_per_trial)
         
         # Record results
         response_made = response > model.response_threshold
+        did_respond = response_made[0] or response_made[1]
         pro_control_accuracy[trial] = np.array_equal(response_made, correct_responses[trial]) * 100
         pro_control_rts[trial] = rt
         learning_rate[trial] = np.linalg.norm(model.A)
@@ -517,7 +543,8 @@ def run_change_signal_simulation():
         predicted_values[trial] = np.linalg.norm(model.V)
         omega_P_values[trial] = np.linalg.norm(model.omega_P)
         omega_N_values[trial] = np.linalg.norm(model.omega_N)
-        # response_activations.append(response)
+        responses[trial] = did_respond
+        responses_got_correct[trial] = np.array_equal(response_made, correct_responses[trial])
         W_S_changes[trial] = np.linalg.norm(model.W_S)
         W_C_changes[trial] = np.linalg.norm(model.W_C)
         W_F_changes[trial] = np.linalg.norm(model.W_F)
@@ -535,10 +562,11 @@ def run_change_signal_simulation():
         'predicted_values': predicted_values,
         'omega_P_values': omega_P_values,
         'omega_N_values': omega_N_values,
-        'response_activations': response_activations,
+        'responses': responses,
+        'responses_got_correct': responses_got_correct,
         'W_S_changes': W_S_changes,
         'W_C_changes': W_C_changes,
-        'W_F_changes': W_F_changes
+        'W_F_changes': W_F_changes,
     }
 
 
@@ -554,7 +582,7 @@ def plot_results(results):
         print(f"Config dir: {matplotlib.get_configdir()}, Available styles: {plt.style.available}")
     
     trials = np.arange(results['n_trials'])
-    fig, axs = plt.subplots(7, 1, figsize=(12, 18), sharex=True)
+    fig, axs = plt.subplots(8, 1, figsize=(12, 18), sharex=True)
     fig.suptitle("Factors Affecting Model Accuracy Over Trials")
     
     # Plot running average accuracy
@@ -591,12 +619,6 @@ def plot_results(results):
     axs[4].set_ylabel("Surprise Signals")
     axs[4].legend()
 
-    # Plot Response Activation
-    # axs[3].plot(trials, results['response_activations'], label="Response Activation (C)", color="green")
-    # axs[3].axhline(y=results['response_threshold'], color="red", linestyle="--", label="Response Threshold")
-    # axs[3].set_ylabel("Response Activation (C)")
-    # axs[3].legend()
-
     # Plot Weight Changes
     axs[5].plot(trials, results['W_S_changes'], label="W_S Changes", color="blue")
     axs[5].plot(trials, results['W_C_changes'], label="W_C Changes", color="orange")
@@ -609,6 +631,12 @@ def plot_results(results):
     axs[6].set_xlabel("Trials")
     axs[6].set_ylabel("Predicted Value")
     axs[6].legend()
+
+    # Plot the actions made
+    axs[7].bar(trials, results['responses'], label="response activations", color="yellow")
+    axs[7].bar(trials, results['responses_got_correct'], label="correct", color="green")
+    axs[7].set_xlabel("Trials")
+    axs[7].legend()
 
     plt.show()
 

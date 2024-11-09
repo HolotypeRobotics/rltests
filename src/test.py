@@ -14,7 +14,7 @@ coords_size = grid_size * 2
 num_objects = 3
 # state, env_input, direction, distances
 input_size = coords_size + num_envs + num_directions + num_objects
-hidden_size = 32
+hidden_size = 10
 motor_efferent_size = num_actions
 learning_rate = 0.01
 
@@ -26,15 +26,15 @@ agent = Agent(coords_size=coords_size,
             output_size_1=num_actions) # reward, effort, and predicted motor efferents for action
 
 # Initialize environment, ACC, and PL
-env = Environment(rewards=[[0, 0, 0, 1, 10],
-                           [0, 0, 1, 1, 0],
-                           [0, 1, 1, 0, 0],
-                           [0, 1, 0, 1, 0],
-                           [0, 0, 0, 0, 10]],
-                  efforts=[[2, 1, 2, 1, 1],
-                           [1, 1, 1, 1, 1],
-                           [1, 1, 2, 1, 1],
-                           [1, 1, 1, 1, 1],
+env = Environment(rewards=[[0, 0, 0, .1, 1],
+                           [0, 0, .1, .1, 0],
+                           [0, .1, .1, 0, 0],
+                           [0, .1, 0, .1, 0],
+                           [0, 0, 0, 0, 1]],
+                  efforts=[[.2, .1, .2, .1, .1],
+                           [.1, .1, .1, .1, .1],
+                           [.1, .1, .2, .1, .1],
+                           [.1, .1, .1, .1, .1],
                            [2, 1, 2, 1, 3]],
                   objects=[[0, 0, 0, 0, 1],
                            [0, 0, 0, 0, 0],
@@ -60,5 +60,9 @@ for episode in range(num_episodes):
     while not done:
 
         # Step
-        loss, done = agent.step(env=env)
+        loss, reward, effort, done = agent.step(env=env)
         total_loss += loss
+        total_reward += reward
+        total_effort += effort
+
+    print(f"Episode: {episode}, Reward: {total_reward}, Effort: {total_effort}, Loss: {total_loss}, epsilon: {agent.epsilon}")

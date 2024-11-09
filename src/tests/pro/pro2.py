@@ -90,12 +90,11 @@ class PROControlModel():
         return np.dot(self.W_S, stimuli)
     
     def set_input_stimuli(self, stimuli):
-        self.update_eligibility_trace(stimuli)
         self.update_delay_chain(stimuli)
+        self.update_eligibility_trace(self.delay_chain)
     
     def compute_temporal_prediction(self):
         """Compute temporal prediction (V) based on stimulus history"""
-
         self.V = np.sum(self.U * self.eligibility_trace, axis=(1, 2))
         if self.V.shape != (self.n_ro_conjunctions,):
             print("Compute temporal returning incorrect dimensions for value:")
@@ -105,7 +104,9 @@ class PROControlModel():
         return self.V
     
     def update_eligibility_trace(self, X):
-        self.eligibility_trace = X + 0.95 * self.eligibility_trace
+        self.eligibility_trace = X + (self.lambda_decay * self.eligibility_trace)
+        print(f"Updated eligibility trace: {self.eligibility_trace}")
+        print()
         return self.eligibility_trace
     
     def compute_prediction_error(self, V_t, V_tp1, r_t):
@@ -121,8 +122,18 @@ class PROControlModel():
         self.delay_chain[0] = stimuli
         print(self.delay_chain)
 
-    def update_temporal_prediction_weights(self, r_t, V_t, V_tp1):
+    def update_temporal_prediction_weights(self, r_t, V_t=None, V_tp1=None):
         """Updates U_ijk based on the TD error."""
+        print(f"Updating temporal prediction weights V_t: {V_t}, vtp1:{V_tp1}")
+        if V_t is None:
+            print("V_t is None")
+            V_t = self.compute_temporal_prediction()
+
+        if V_tp1 is None:
+            print("V_tp1 is None")
+            V_tp1 = self.compute_temporal_prediction()
+
+
         delta = self.compute_prediction_error(V_t, V_tp1, r_t)
 
         delta = r_t + self.gamma * V_tp1 - V_t
@@ -132,7 +143,6 @@ class PROControlModel():
 
         # Update rule for U
         self.U += self.alphaTD * delta * self.eligibility_trace
-
 
     def update_outcome_weights(self, stimuli, outcomes, subjective_badness):
         """Update outcome prediction weights with value modulation"""
@@ -217,16 +227,14 @@ class PROControlModel():
         self.W_omega_N = np.clip(self.W_omega_N, -1, 1)
 
 
-def update_models(pro_control_model, stimulus, correct_response, 
-                 pro_control_response, next_stimulus=None):
+def update_model(model, stimulus, correct_response, 
+                 actual_response, V_t=None):
     # Convert binary correct_response to outcome vector
-    pro_control_outcome = np.zeros(pro_control_model.n_outcomes * pro_control_model.n_responses)
+    pro_control_outcome = np.zeros(model.n_outcomes * model.n_responses)
     
     # Determine if response was correct
-    response_made = pro_control_response > pro_control_model.response_threshold
+    response_made = actual_response > model.response_threshold
     is_correct = np.array_equal(response_made, correct_response)
-    print(f"is correct: {is_correct}")
-    print(f"pro control outcome: {pro_control_outcome}")
     # Set appropriate outcome signals
     if response_made[0]:    # If there was a Go response
         print("response made 0")
@@ -238,34 +246,33 @@ def update_models(pro_control_model, stimulus, correct_response,
         pro_control_outcome[3] = float(not is_correct)  # Change error
     
     # Update PRO-Control model
-    pro_control_model.update_outcome_weights(stimulus, pro_control_outcome, subjective_badness=1.5)
+    model.update_outcome_weights(stimulus, pro_control_outcome, subjective_badness=1.5)
     
     # Compute surprise signals for reactive control
-    S = pro_control_model.compute_outcome_prediction(stimulus)
-    omega_P, omega_N = pro_control_model.compute_surprise(S, pro_control_outcome)
+    S = model.compute_outcome_prediction(stimulus)
+    omega_P, omega_N = model.compute_surprise(S, pro_control_outcome)
 
     # Update reactive control with stronger learning signal
     outcome_valence = 1.0 if is_correct else -0.5  # Stronger punishment for errors
-    pro_control_model.update_reactive_control(response_made, omega_N, outcome_valence)
+    model.update_reactive_control(response_made, omega_N, outcome_valence)
     
     # Update proactive component with stronger learning signal
-    pro_control_model.update_proactive_WF(response_made, pro_control_outcome, outcome_valence)
+    model.update_proactive_WF(response_made, pro_control_outcome, outcome_valence)
 
     # Update temporal predictions with actual next state
-    if next_stimulus is not None:
-        #TODO: figure out how to not set stimulus twice, because next stimulus becomes stimulus on next time step
-        pro_control_model.set_input_stimulus(stimulus)
-        V_t = pro_control_model.compute_temporal_prediction(stimulus)
-        pro_control_model.set_input_stimulus(next_stimulus)
-        V_tp1 = pro_control_model.compute_temporal_prediction(next_stimulus)
-        # Calculate the reward signal
-        if is_correct:
-            r_t = 1.0  # Reward for correct response
-        else:
-            r_t = -0.5  # Penalty for incorrect response (adjust as needed)
-        
-        # Update temporal predictions with reward
-        pro_control_model.update_temporal_prediction_weights(r_t, V_t, V_tp1)
+
+    model.set_input_stimuli(stimulus)
+    V_tp1 = model.compute_temporal_prediction()
+    # Calculate the reward signal
+    if is_correct:
+        r_t = 1.0  # Reward for correct response
+    else:
+        r_t = -0.5  # Penalty for incorrect response (adjust as needed)
+    
+    # Update temporal predictions with reward
+    model.update_temporal_prediction_weights(r_t, V_t, V_tp1)
+
+    return V_tp1
 
 def create_change_signal_task(n_trials=100, change_prob=0.4):
     print(f"Creating change signal task with {n_trials} trials")
@@ -331,17 +338,17 @@ def diagnostic_pro_control_model():
         n_outcomes=2,
         dt=0.01,     # Time step
         n_timesteps=250, # Number of time steps
-        n_delay_units=20, # Number of delay units
-        alphaRO=1, # Initial learning rate
-        alphaTD=1,
-        gamma=0.95, # Temporal discount
-        lambda_decay=0.999, # Decay rate for eligibility traces
+        n_delay_units=10, # Number of delay units
+        alphaRO=0.012, # Initial learning rate
+        alphaTD=0.1,
+        gamma=0.1, # Temporal discount
+        lambda_decay=0.95, # Decay rate for eligibility traces
         beta=1.0,  # Response gain
         noise_sigma=0.002, # Response noise
-        response_threshold=0.36, # Response threshold
-        psi=0.99,  # Inhibition scaling
-        phi=1.0,  # Control signal scaling
-        rho=0.35   # Excitation scaling
+        response_threshold=0.25, # Response threshold
+        psi=0.724,  # Inhibition scaling
+        phi=2.246,  # Control signal scaling
+        rho=1.746   # Excitation scaling
         )
     
     # Print initial weights
@@ -379,6 +386,7 @@ def run_change_signal_simulation():
     W_C_changes =           np.zeros(n_trials)
     W_F_changes =           np.zeros(n_trials)
     
+    V_t = None
     # Run first few trials with detailed monitoring
     for trial in range(min(5, n_trials)):
         print(f"\n=== Trial {trial + 1} ===")
@@ -397,10 +405,10 @@ def run_change_signal_simulation():
         pro_control_accuracy[trial] = np.array_equal(response_made, correct_responses[trial]) * 100
         print(f"Accuracy: {pro_control_accuracy[trial]}")
         pro_control_rts[trial] = rt
-        
+
         # Update model
-        update_models( model, stimuli[trial], correct_responses[trial],
-                     response, stimuli[trial + 1] if trial < n_trials - 1 else None)
+        V_t = update_model( model, stimuli[trial], correct_responses[trial],
+                     response, V_t)
         
         # Print weight updates
         print("\nWeight updates:")
@@ -432,8 +440,8 @@ def run_change_signal_simulation():
         W_F_changes[trial] = np.linalg.norm(model.W_F)
 
         # Update model
-        update_models(model, stimuli[trial], correct_responses[trial],
-                     response, stimuli[trial + 1] if trial < n_trials - 1 else None)
+        V_t = update_model(model, stimuli[trial], correct_responses[trial],
+                     response, V_t)
 
     return {
         'n_trials': n_trials,

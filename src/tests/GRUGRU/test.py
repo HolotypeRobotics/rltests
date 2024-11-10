@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from environment import Environment
-from agent import Agent
+from tests.grugru.environment import Environment
+from tests.grugru.agent import Agent
 
 # Hyperparameters
 grid_size = 5

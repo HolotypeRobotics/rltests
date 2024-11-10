@@ -3,17 +3,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-
-# The objective of the ACC is by telling the Prelimbic cortex
-# when to switch out of the current trajectory.
-# This can be accomlished if there are multple competing goals in a hierarchy
-# (i.e. a distrobution of goals in the PL), and the ACC inhibits the
-# current goal. The ACC can also inhibit the next action,
-# The ACC needs to keep track of the reward of the actions not taken
-# The ACC should Bias the Goal in the PL
-# The Goal would be a state at the end of a rollout
-# Studies show ACC predicts and calculates cost-benefit arbitration into a single prospective decision variable
-
+"""
+    The objective of the ACC is to tell the Prelimbic cortex
+    when to switch out of the current trajectory.
+    This can be accomlished if there are multple competing goals in a hierarchy
+    (i.e. a distrobution of goals in the PL), and the ACC inhibits the
+    current goal. The ACC can also inhibit the next action,
+    The ACC needs to keep track of the reward of the actions not taken
+    The ACC should Bias the Goal in the PL
+    The Goal would be a state at the end of a rollout
+    Studies show ACC predicts and calculates cost-benefit arbitration
+    into a single prospective decision variable.
+    This is a lot of different behaviors, and very confusing to implement.
+"""
 # Define the recurrent module
 class RecurrentModule(nn.Module):
     def __init__(self, input_size, hidden_size):

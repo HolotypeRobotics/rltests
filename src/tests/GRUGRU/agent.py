@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from grugru import GRUGRU
+from tests.grugru.grugru import GRUGRU
 
 class Agent:
     def __init__(self, coords_size, env_enc_size, direction_size, distance_size, hidden_size, output_size_1, learning_rate=0.001, epsilon=1.0, epsilon_decay=0.9999):

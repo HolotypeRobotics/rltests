@@ -228,7 +228,6 @@ class PROControlModel():
         self.W_omega_N = 0.25 * (self.W_omega_N + outcome_valence * T * omega)
         self.W_omega_N = np.clip(self.W_omega_N, -1, 1)
 
-
 def update_model(model, stimulus, correct_response, 
                  actual_response, V_t=None):
     # Convert binary correct_response to outcome vector

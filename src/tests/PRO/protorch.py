@@ -101,7 +101,6 @@ class PROControl(nn.Module):
             if norm_factor > 1:
                 self.W_F.data /= norm_factor
 
-
     def compute_losses(self, response, pred_ro, pred_temporal, actual_ro, actual_values):
         """Compute the losses for the model."""
 
@@ -251,9 +250,6 @@ class PROControl(nn.Module):
             'td_error': td_error,
             'valence_loss': valence_loss
         }
-    
-
-
 
 class GoNoGoTask:
     def __init__(self, p_go=0.7):
@@ -279,8 +275,6 @@ class GoNoGoTask:
         correct_response[0 if is_go_trial else 1] = 1.0
         
         return stimulus, correct_response, is_go_trial
-
-
 
 class ChangeSignalTask:
     def __init__(self, change_prob=0.3, change_delay_range=(130, 330)):
@@ -310,7 +304,6 @@ class ChangeSignalTask:
 
         return stimulus, correct_response, is_change_trial
 
-
 class ForagingTask:
     def __init__(self, n_forage_options=6, forage_cost=0.1):
         self.n_forage_options = n_forage_options
@@ -336,7 +329,6 @@ class ForagingTask:
 
         return stimulus, engage_values, forage_values
 
-
 class RiskAvoidanceTask:
     def __init__(self, risky_win_prob=0.5):
         self.risky_win_prob = risky_win_prob
@@ -347,7 +339,6 @@ class RiskAvoidanceTask:
     def generate_trial(self):
         stimulus = torch.ones(self.n_stimuli) # Always 1
         return stimulus
-
 
 class CorrelatedOutcomesTask:
     def __init__(self, p_switch_values):
@@ -364,7 +355,6 @@ class CorrelatedOutcomesTask:
             current_correct_option = 1 - current_correct_option
 
         return stimulus, current_correct_option
-
 
 class GoNoGoTrainer:
     def __init__(self, model, task, learning_rate=0.001, or_learning_rate=0.001):

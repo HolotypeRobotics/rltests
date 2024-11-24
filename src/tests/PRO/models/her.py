@@ -51,6 +51,7 @@ class HER(nn.Module):
         super(HER, self).__init__()
         self.n_layers = n_layers
         self.n_representations = n_representations
+        self.n_outcomes = n_outcomes
         self.gamma = gamma
 
         # Working Memory and Gating Mechanisms
@@ -84,7 +85,7 @@ class HER(nn.Module):
             modulation_from_above = None
             if i < self.n_layers - 1:
                 p_higher = self.layers[i+1](self.WM[i+1])
-                modulation_from_above = p_higher.reshape(self.n_representations, n_outcomes)  # Reshape for additive modulation
+                modulation_from_above = p_higher.reshape(self.n_representations, self.n_outcomes)  # Reshape for additive modulation
                 modulations.append(modulation_from_above)
 
             p = self.layers[i](r, modulation_from_above)

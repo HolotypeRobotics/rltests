@@ -1,232 +1,13 @@
-import numpy as np
+from models.pro_control import PROControlModel
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import numpy as np
+
 
 """
-This version is based on pro3.py, but removed all comments, and combined pro-control/pro model into single class.
+This is a test of the numpy based pro-control model using the Change signal task.
 """
-class PROControlModel():
-    def __init__(self,
-                n_stimuli,
-                n_responses,
-                n_outcomes,
-                n_timesteps,
-                n_delay_units,
-                dt=0.1, 
-                alphaRO=0.1,
-                alphaTD=0.1,
-                beta=0.1,
-                gamma=0.95,
-                lambda_decay=0.95,
-                psi=0.1,
-                phi=0.1,
-                rho=0.1,
-                noise_sigma=0.1,
-                response_threshold=0.1
-                ):
-
-        # Dimensions
-        self.n_stimuli = n_stimuli
-        self.n_responses= n_responses
-        self.n_outcomes = n_outcomes
-        self.n_ro_conjunctions = n_responses * n_outcomes  # Number of response-outcome combinations
-
-        # Basic parameters
-        self.dt = dt  # Time step (10ms)
-        self.gamma = gamma  # Temporal discount parameter
-        self.alphaRO = alphaRO  # Base learning rate for response outcome conjunction learning
-        self.alphaTD = alphaTD  # Base learning rate for temporal difference learning
-        self.n_timesteps = n_timesteps  # Length of the tapped delay chain
-        self.lambda_decay = lambda_decay  # Eligibility trace decay factor
-
-        # Initialize weights
-        self.W_S = np.abs(np.random.normal(0.1, 0.05, (self.n_ro_conjunctions, n_stimuli))) # Response Output conjunction weights
-        self.W_C = np.full((n_responses, n_stimuli), 1)  # Stimulus to response weights (Non-learning)
-        self.W_F = -np.abs(np.random.normal(0, 0.1, (self.n_ro_conjunctions, n_responses))) # Learned top-down control from R-O units to Response units
-        self.W_I = np.zeros((n_responses, n_responses))  # Fixed Mutual inhibition weights between response units
-        np.fill_diagonal(self.W_I, -1)  # Self-inhibition
-        self.delay_chain = np.zeros((n_delay_units, n_stimuli))
-        self.U = np.zeros((self.n_ro_conjunctions, n_delay_units, n_stimuli))  # Temporal prediction weights 
-        self.eligibility_trace = np.zeros((n_delay_units, n_stimuli))
-        
-        # Normalize WF weights as specified in the paper
-        # Sum of absolute values should not exceed number of R-O conjunctions
-        norm_factor = np.sum(np.abs(self.W_F)) / (n_responses * n_outcomes)
-        if norm_factor > 1:
-            self.W_F /= norm_factor
-
-        # Response parameters
-        self.beta = beta  # Response gain
-        self.noise_sigma = noise_sigma # Response noise
-        self.response_threshold = response_threshold # Response threshold
-
-        # Scaling parameters
-        self.psi = psi  # Inhibition scaling
-        self.phi = phi  # Control signal scaling
-        self.rho = rho  # Excitation scaling
-
-        self.C = np.zeros(n_responses)  # Responses
-        self.A = self.alphaRO  # Effective learning rate
-
-        self.TD_error = np.zeros(self.n_ro_conjunctions)  # TD error
-        self.V = np.zeros(self.n_ro_conjunctions)  # Value predictions
-        
-        # Extra values for tracking/visualization
-        # Surprise vectors for each outcome
-        self.omega_P = np.zeros((n_outcomes))  # Positive surprise
-        self.omega_N = np.zeros((n_outcomes))  # Negative surprise
-
-        # Weights from surprise to response weights
-        self.W_omega_P = np.random.normal(0, 0.1, (n_responses, self.n_ro_conjunctions))  # Positive surprise to response weights
-        self.W_omega_N = np.random.normal(0, 0.1, (n_responses, self.n_ro_conjunctions))  # Negative surprise to response weights
-
-
-    def update_learning_rate(self, omega_P, omega_N):
-        self.A = self.alphaRO / (1 + omega_P + omega_N)
-        return self.A
-
-    def compute_outcome_prediction(self, stimuli):
-        return np.dot(self.W_S, stimuli)
-    
-    def set_input_stimuli(self, stimuli):
-        self.update_delay_chain(stimuli)
-        self.update_eligibility_trace(self.delay_chain)
-    
-    def compute_temporal_prediction(self):
-        """Compute temporal prediction (V) based on stimulus history"""
-        self.V = np.sum(self.U * self.eligibility_trace, axis=(1, 2))
-        if self.V.shape != (self.n_ro_conjunctions,):
-            print("Compute temporal returning incorrect dimensions for value:")
-            print(f"V: {self.V.shape}")
-            print(f"Should be: ({self.n_ro_conjunctions},)")
-            input("Press Enter to continue...")
-        return self.V
-    
-    def update_eligibility_trace(self, X):
-        self.eligibility_trace = X + (self.lambda_decay * self.eligibility_trace)
-        print(f"Updated eligibility trace: {self.eligibility_trace}")
-        print()
-        return self.eligibility_trace
-    
-    def compute_prediction_error(self, V_t, V_tp1, r_t):
-        self.TD_error = r_t + self.gamma * V_tp1 - V_t
-        return self.TD_error
-
-    def compute_surprise(self, predicted, actual):
-        omega_P = np.maximum(0, actual - predicted)  # Unexpected occurrences
-        omega_N = np.maximum(0, predicted - actual)  # Unexpected non-occurrences
-        return omega_P, omega_N
-
-    def update_delay_chain(self, stimuli):
-        self.delay_chain = np.roll(self.delay_chain, 1, axis=0)
-        self.delay_chain[0] = stimuli
-        print(self.delay_chain)
-
-    def update_temporal_prediction_weights(self, r_t, V_t=None, V_tp1=None):
-        """Updates U_ijk based on the TD error."""
-        print(f"Updating temporal prediction weights V_t: {V_t}, vtp1:{V_tp1}")
-        if V_t is None:
-            print("V_t is None")
-            V_t = self.compute_temporal_prediction()
-
-        if V_tp1 is None:
-            print("V_tp1 is None")
-            V_tp1 = self.compute_temporal_prediction()
-
-
-        delta = self.compute_prediction_error(V_t, V_tp1, r_t)
-
-        delta = r_t + self.gamma * V_tp1 - V_t
-
-        # Reshape delta to (4, 1, 1) so it can broadcast across U
-        delta = delta[:, np.newaxis, np.newaxis]
-
-        # Update rule for U
-        self.U += self.alphaTD * delta * self.eligibility_trace
-        self.U = np.clip(self.U, -1, 1)
-
-    def update_outcome_weights(self, stimuli, outcomes, subjective_badness):
-        """Update outcome prediction weights with value modulation"""
-        theta = subjective_badness
-        S = self.compute_outcome_prediction(stimuli)
-        
-        # Learning rate modulation based on surprise
-        self.omega_P, self.omega_N = self.compute_surprise(S, outcomes)
-        A = self.update_learning_rate(self.omega_P, self.omega_N)
-        
-        # Update weights with value modulation (theta)
-        delta = A * (theta * outcomes - S)
-        self.W_S += np.outer(delta, stimuli)
-
-    def rectify(self, x):
-        """Implement the [x]+ rectification function"""
-        return np.maximum(0, x)
-
-    def calculate_excitation(self, D, S):
-        # Direct S-R associations
-        direct_term = np.dot(D, self.W_C)
-        print(f"Direct term: {direct_term}")
-        
-        # Proactive control
-        proactive_term = self.rectify(np.dot(-S, self.W_F))
-        print(f"Proactive term: {proactive_term}")
-
-        reactive_term = np.sum(self.rectify(-self.W_omega_N), axis=1)  # Apply weights to each outcome
-
-        # Combine terms with scaling
-        E = self.rho * (direct_term + proactive_term + reactive_term)
-        print(f"Excitation: {E}")
-        
-        return E
-
-    def calculate_inhibition(self, C, S):
-        # Direct inhibition
-        direct_inhib = self.psi * np.dot(C, self.W_I)
-        print(f"Direct inhibition: {direct_inhib}")
-        
-        # Proactive control inhibition
-        proactive_inhib = self.rectify(np.dot(S, self.W_F))
-        print(f"Proactive inhibition: {proactive_inhib}")
-
-        reactive_inhib = self.rectify(np.sum(self.W_omega_N, axis=1)) # Apply weights to each outcome
-        print(f"Reactive inhibition: {reactive_inhib}")
-        
-        # Combine control terms with scaling
-        control_inhib = self.phi * (proactive_inhib + reactive_inhib)
-        print(f"Control inhibition: {control_inhib}")
-        
-        # Total inhibition
-        I = direct_inhib + control_inhib
-        print(f"Total inhibition: {I}")
-
-        return I
-
-    def compute_response_activation(self, stimuli, C, ro_conjuction):
-
-        E = self.calculate_excitation(stimuli, ro_conjuction)
-        I = self.calculate_inhibition(C, ro_conjuction)
-        
-        noise = np.random.normal(0, self.noise_sigma, self.n_responses)
-        delta_C = self.beta * self.dt * (E * (1 - C) - (C + 0.05) * (I + 1) + noise)
-        self.C = np.clip(C + delta_C, 0, 1)
-    
-        return self.C
-
-    def update_proactive_WF(self, response, outcomes, outcome_valence, learning=True):
-        """Update W_F (proactive component)"""
-        if learning:
-            for i in range(self.n_responses):
-                if response[i] > self.response_threshold:  # T_i,t
-                    for k in range(self.n_outcomes):
-                        self.W_F[i, k] += 0.01 * response[i] * outcomes[k] * outcome_valence
-        
-    def update_reactive_control(self, response, omega_N, outcome_valence):
-        executed_responses = (response > self.response_threshold).astype(float)        
-        T = executed_responses.reshape(-1, 1)
-        omega = omega_N.reshape(1, -1)
-        self.W_omega_N = 0.25 * (self.W_omega_N + outcome_valence * T * omega)
-        self.W_omega_N = np.clip(self.W_omega_N, -1, 1)
 
 def update_model(model, stimulus, correct_response, 
                  actual_response, V_t=None):
@@ -238,11 +19,9 @@ def update_model(model, stimulus, correct_response,
     is_correct = np.array_equal(response_made, correct_response)
     # Set appropriate outcome signals
     if response_made[0]:    # If there was a Go response
-        print("response made 0")
         pro_control_outcome[0] = float(is_correct)  # Go correct
         pro_control_outcome[1] = float(not is_correct)  # Go error
     elif response_made[1]:  # if there was a Change response
-        print("response made 1")
         pro_control_outcome[2] = float(is_correct)  # Change correct
         pro_control_outcome[3] = float(not is_correct)  # Change error
     
@@ -254,11 +33,11 @@ def update_model(model, stimulus, correct_response,
     omega_P, omega_N = model.compute_surprise(S, pro_control_outcome)
 
     # Update reactive control with stronger learning signal
-    outcome_valence = 1.0 if is_correct else -0.5  # Stronger punishment for errors
-    model.update_reactive_control(response_made, omega_N, outcome_valence)
+    valence_signal = -0.1 if is_correct else 1 # (valence y = -0.1 if correct, 1 if incorrect eq 14)
+    model.update_reactive_control(response_made, omega_N, valence_signal)
     
     # Update proactive component with stronger learning signal
-    model.update_proactive_WF(response_made, pro_control_outcome, outcome_valence)
+    model.update_proactive_WF(response_made, pro_control_outcome, valence_signal)
 
     # Update temporal predictions with actual next state
 
@@ -268,15 +47,14 @@ def update_model(model, stimulus, correct_response,
     if is_correct:
         r_t = 1.0  # Reward for correct response
     else:
-        r_t = -0.5  # Penalty for incorrect response (adjust as needed)
+        r_t = -1.0  # Penalty for incorrect response (adjust as needed)
     
-    # Update temporal predictions with reward
+    # Update temporal predictions witFh reward
     model.update_temporal_prediction_weights(r_t, V_t, V_tp1)
 
     return V_tp1
 
 def create_change_signal_task(n_trials=100, change_prob=0.4):
-    print(f"Creating change signal task with {n_trials} trials")
     # Initialize task structure
     stimuli = np.zeros((n_trials, 2))  # [go_signal, change_signal]
     correct_responses = np.zeros((n_trials, 2))  # [go_response, change_response]
@@ -340,16 +118,16 @@ def diagnostic_pro_control_model():
         dt=0.01,     # Time step
         n_timesteps=250, # Number of time steps
         n_delay_units=10, # Number of delay units
-        alphaRO=1., # Initial learning rate
+        alphaRO=1.5, # Initial learning rate
         alphaTD=0.1,
         gamma=0.095, # Temporal discount
-        lambda_decay=0.95, # Decay rate for eligibility traces
-        beta=1.0,  # Response gain
+        lambda_decay=0.5, # Decay rate for eligibility traces
+        beta=1,  # Response gain
         noise_sigma=0.0001, # Response noise
-        response_threshold=0.25, # Response threshold
-        psi=0.7,  # Inhibition scaling
-        phi=2.246,  # Control signal scaling
-        rho=1.746   # Excitation scaling
+        response_threshold=0.15, # Response threshold
+        psi=1.5,  # Inhibition scaling
+        phi=1.5,  # Control signal scaling
+        rho=1.0   # Excitation scaling
         )
     
     # Print initial weights
@@ -412,8 +190,7 @@ def run_change_signal_simulation():
                      response, V_t)
         
         # Print weight updates
-        print("\nWeight updates:")
-        print(f"W_C:\n{model.W_C}")
+        print("\nWeights:")
         print(f"W_F:\n{model.W_F}")
         print(f"W_S:\n{model.W_S}")
 

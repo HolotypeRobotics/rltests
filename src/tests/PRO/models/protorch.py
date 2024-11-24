@@ -17,8 +17,8 @@ class OutcomeRepresentation(nn.Module):
 
     def forward(self, stimuli):
         x = F.relu(self.fc1(stimuli))
-        valence = self.fc2(x)  # Output is valence for each R-O conjunction
-        return valence
+        badness = F.relu(self.fc2(x))  # Output is "badness" signal (non-negative)
+        return badness
 
 class PROControl(nn.Module):
     def __init__(self,
@@ -37,9 +37,9 @@ class PROControl(nn.Module):
                  phi=0.1,  # Control scaling
                  rho=0.1,  # Excitation scaling
                  response_threshold=0.5,  # Response threshold
+                 sigma=0.1, # Noise standard deviation
                  device='cpu'):
         super().__init__()
-        
         self.device = device
 
         
@@ -64,7 +64,8 @@ class PROControl(nn.Module):
         self.psi = psi
         self.phi = phi
         self.rho = rho
-        
+        self.sigma = sigma
+
         # Initialize learnable weights
         # R-O conjunction prediction weights
         self.W_S = nn.Parameter(torch.abs(
@@ -120,8 +121,9 @@ class PROControl(nn.Module):
 
     def compute_ro_prediction(self, stimuli):
         """Predict response-outcome conjunctions"""
-        valence = self.outcome_rep(stimuli)
-        return torch.matmul(self.W_S, stimuli) * valence # Valence scaling
+        badness = self.outcome_rep(stimuli)
+        ro_conj = torch.matmul(self.W_S, stimuli)
+        return ro_conj, badness  # Return both RO conjunction and badness
     
     def update_temporal_components(self, stimuli):
         """Update delay chain and eligibility trace"""
@@ -146,7 +148,6 @@ class PROControl(nn.Module):
     def compute_effective_learning_rate(self, omega_p, omega_n):
         """Compute surprise-modulated learning rate (equation 3)"""
         return self.alpha_ro / (1 + omega_p + omega_n)
-
     
     def compute_response_activation(self, stimuli, ro_predictions):
         """Compute response activation (equations 5-7)"""
@@ -161,7 +162,7 @@ class PROControl(nn.Module):
         inhibition = self.psi * torch.matmul(self.C, self.W_I)
         
         # Compute activation change
-        noise = torch.normal(0, 0.1, self.C.shape, device=self.device)
+        noise = torch.normal(0, self.sigma, self.C.shape, device=self.device)
         delta_C = self.beta * self.dt * (
             excitation * (1 - self.C) - 
             (self.C + 0.05) * (inhibition + control) + noise
@@ -182,7 +183,6 @@ class PROControl(nn.Module):
         reactive = F.relu(torch.matmul(omega_n, self.W_R.t())) # Transpose W_R for correct matrix multiplication
 
         return proactive, reactive
-    
 
     def forward(self, stimuli):
         # Update temporal components
@@ -214,7 +214,14 @@ class PROControl(nn.Module):
         # Update R-O conjunction weights (equations 1-3)
         effective_lr = self.compute_effective_learning_rate(omega_p, omega_n)
         ro_error = (self.theta * actual_ro - ro_predictions) * outcome_valence
+
+        print(f" old w_s{self.W_S.data}")
+
+        print(f" effective lr {effective_lr}")
+
         self.W_S.data += gating_signal * effective_lr * torch.outer(ro_error, stimuli)
+
+        print(f" new w_s{self.W_S.data}")
         
         # Update temporal prediction weights
         td_error = (reward + 

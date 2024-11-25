@@ -9,16 +9,6 @@ from collections import defaultdict
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-class OutcomeRepresentation(nn.Module):
-    def __init__(self, n_stimuli, n_ro_conjunctions, hidden_size=32):
-        super().__init__()
-        self.fc1 = nn.Linear(n_stimuli, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, n_ro_conjunctions)
-
-    def forward(self, stimuli):
-        x = F.relu(self.fc1(stimuli))
-        badness = F.relu(self.fc2(x))  # Output is "badness" signal (non-negative)
-        return badness
 
 class PROControl(nn.Module):
     def __init__(self,
@@ -49,8 +39,6 @@ class PROControl(nn.Module):
         self.n_outcomes = n_outcomes
         self.n_ro_conjunctions = n_responses * n_outcomes
         self.n_delay_units = n_delay_units
-        self.outcome_rep = OutcomeRepresentation(n_stimuli, self.n_ro_conjunctions).to(device)
-        self.optimizer_or = None # Add optimizer for outcome representation
 
         # Parameters
         self.dt = dt
@@ -75,8 +63,7 @@ class PROControl(nn.Module):
         self.register_buffer('W_C', torch.ones((n_responses, n_stimuli)))
         
         # Proactive control weights (equation 12 in paper)
-        self.W_F = nn.Parameter(-torch.abs(
-            torch.normal(0, 0.1, (self.n_ro_conjunctions, n_responses))))
+        self.W_F = nn.Parameter(torch.normal(0, 0.1, (self.n_ro_conjunctions, n_responses)))
         
         # Reactive control weights
         self.W_R = nn.Parameter(torch.zeros((n_responses, self.n_ro_conjunctions)))
@@ -88,7 +75,6 @@ class PROControl(nn.Module):
         # Temporal prediction weights
         self.U = nn.Parameter(torch.zeros(
             (self.n_ro_conjunctions, n_delay_units, n_stimuli)))
-        
         # State buffers
         self.register_buffer('delay_chain', 
                            torch.zeros((n_delay_units, n_stimuli)))
@@ -102,95 +88,101 @@ class PROControl(nn.Module):
             if norm_factor > 1:
                 self.W_F.data /= norm_factor
 
-    def compute_losses(self, response, pred_ro, pred_temporal, actual_ro, actual_values):
-        """Compute the losses for the model."""
+    def compute_losses(self, *args): # No valence loss now
+        return {'total_loss': torch.tensor(0.0, requires_grad=True)} # Dummy loss
 
-        # R-O prediction loss (using MSE loss for now, but could be something else)
-        ro_loss = F.mse_loss(pred_ro, actual_ro)
-
-        # Temporal difference loss (using MSE loss)
-        td_loss = F.mse_loss(pred_temporal, actual_values)
-
-        # Total loss (weighted sum of individual losses)
-        total_loss = ro_loss + td_loss  # Adjust weights as needed
-        return {
-            'ro_loss': ro_loss,
-            'td_loss': td_loss,
-            'total_loss': total_loss
-        }
-
+    # PRO Eq. (3)
     def compute_ro_prediction(self, stimuli):
-        """Predict response-outcome conjunctions"""
-        badness = self.outcome_rep(stimuli)
+        """Predict response-outcome conjunctions
+        returns RO conjunctions shape: n_ro_conjunctions
+        """
         ro_conj = torch.matmul(self.W_S, stimuli)
-        return ro_conj, badness  # Return both RO conjunction and badness
+        return ro_conj  # Return RO conjunction
     
     def update_temporal_components(self, stimuli):
         """Update delay chain and eligibility trace"""
-        # Roll delay chain
+        # Roll delay chain. X in PRO Eq. (9)
         self.delay_chain = torch.roll(self.delay_chain, 1, dims=0)
         self.delay_chain[0] = stimuli
+        print(f"delay chain: {self.delay_chain}")
         
-        # Update eligibility trace
+        # Update eligibility trace PRO Eq. (10)
         self.eligibility_trace = (self.delay_chain + 
                                 self.lambda_decay * self.eligibility_trace)
-        
+        print(f"eligibility trace: {self.eligibility_trace}")
+
+    # PRO Eq. (8)
     def compute_temporal_prediction(self):
-        """Compute temporal predictions using eligibility trace"""
-        return torch.sum(self.U * self.eligibility_trace, dim=(1, 2))
+        """Compute temporal predictions using eligibility trace
+        returns value vector shape: n_ro_conjunctions"""
+        return torch.sum(self.U * self.delay_chain, dim=(1, 2))
     
+    # PRO Eq. (15-16)
     def compute_surprise(self, predicted_ro, actual_ro):
-        """Compute positive and negative surprise (equation 2)"""
+        """Compute positive and negative surprise (equation 2)
+        returns positive and negative surprize tuple with shapes n_ro_conjuctions"""
         omega_p = F.relu(actual_ro - predicted_ro)
         omega_n = F.relu(predicted_ro - actual_ro)
         return omega_p, omega_n
     
+    # PRO Eq. (5)
     def compute_effective_learning_rate(self, omega_p, omega_n):
-        """Compute surprise-modulated learning rate (equation 3)"""
+        """Compute surprise-modulated learning rate
+        returns vector of learning rates shape: n_ro_conjunctions"""
         return self.alpha_ro / (1 + omega_p + omega_n)
-    
+
+
+    # PRO-control Eq. (2)
+    def compute_excitation(self, stimuli, ro_predictions):
+        """Compute excitation term of activation"""
+        direct_term = torch.matmul(stimuli, self.W_C)
+        proactive_term = torch.clamp(torch.matmul(-ro_predictions, self.W_F), min=0)
+        reactive_term = torch.sum(torch.clamp(-self.W_R, min=0), dim=1)
+        excitation = self.rho * (direct_term + proactive_term + reactive_term)
+        return excitation
+
+    # PRO-control Eq. (3)
+    def compute_inhibition(self, stimuli, ro_predictions):
+        """Compute inhibition term of activation"""
+
+        # Direct inhibition
+        direct_inhib = self.psi * torch.matmul(stimuli, self.W_I)
+
+        # Control Inhibition
+        proactive_inhib = torch.clamp(torch.matmul(ro_predictions, self.W_F), min=0)
+        reactive_inhib = torch.sum(torch.clamp(self.W_R, min=0), dim=1)
+        control_inhib = self.phi * (proactive_inhib + reactive_inhib)
+
+        inhibition = direct_inhib + control_inhib
+        return inhibition
+
+    # Pro Eq. (11) and PRO-Control Eq. (2-3)
+    # May want to change this later to use different activation function
     def compute_response_activation(self, stimuli, ro_predictions):
         """Compute response activation (equations 5-7)"""
-        # Direct pathway
-        excitation = self.rho * torch.matmul(stimuli, self.W_C.t())
+
+        excitation = self.compute_excitation(stimuli, ro_predictions)
         
-        # Control pathways
-        proactive, reactive = self.compute_control_signals(ro_predictions, self.C)
-        control = self.phi * (proactive + reactive)
-        
-        # Mutual inhibition
-        inhibition = self.psi * torch.matmul(self.C, self.W_I)
-        
-        # Compute activation change
+        inhibition = self.compute_inhibition(stimuli, ro_predictions)
+
+        # Compute activation change PRO Eq. (11)
         noise = torch.normal(0, self.sigma, self.C.shape, device=self.device)
         delta_C = self.beta * self.dt * (
             excitation * (1 - self.C) - 
-            (self.C + 0.05) * (inhibition + control) + noise
+            (self.C + 0.05) * (inhibition + 1) + noise
         )
         
         # Update activation
-        self.C = self.C + delta_C
-        self.C = torch.sigmoid(self.C) # Sigmoid activation for regularization
+        self.C = torch.clamp(self.C + delta_C, min=0, max=1)
         return self.C
 
-    def compute_control_signals(self, ro_predictions, response):
-        """Compute proactive and reactive control signals - CORRECTED"""
-        # Proactive control (equations 8-9) - Removed ReLU for push-pull
-        proactive = -torch.matmul(ro_predictions, self.W_F) 
-
-        # Reactive control based on *negative* surprise ONLY
-        _, omega_n = self.compute_surprise(ro_predictions, torch.zeros_like(ro_predictions))
-        reactive = F.relu(torch.matmul(omega_n, self.W_R.t())) # Transpose W_R for correct matrix multiplication
-
-        return proactive, reactive
-
     def forward(self, stimuli):
-        # Update temporal components
-        self.update_temporal_components(stimuli)
-        
         # Predict R-O conjunctions
         ro_predictions = self.compute_ro_prediction(stimuli)
-        
+
+        # Update temporal components
+        self.update_temporal_components(stimuli)
+
         # Compute temporal prediction
         temporal_prediction = self.compute_temporal_prediction()
         
@@ -200,62 +192,55 @@ class PROControl(nn.Module):
         response_discrete = (response > self.response_threshold).float() # Thresholding
         
         return response, ro_predictions, temporal_prediction, response_discrete
-    
-    def update_weights(self, stimuli, response, actual_ro, reward, 
-                      outcome_valence, gating_signal):
+
+    # Update R-O conjunction weights PRO-Control Eq. (1)
+    def update_prediction_weights(self, stimuli, learning_rate, actual_ro, ro_predictions, gating_signal=True):
+        """Update prediction weights based on experience"""
+
+        print(f"effective lr: {learning_rate}")
+        print(f"stimuli: {stimuli}")
+        print(f"self.W_S: {self.W_S}")
+        print(f"actual_ro: {actual_ro}")
+        print(f"ro_predictions: {ro_predictions}")
+        ro_error = (self.theta * actual_ro - ro_predictions)
+        print(f"ro_error: {ro_error}")
+        self.W_S.data += gating_signal * torch.outer( learning_rate * ro_error, stimuli)
+
+    def update_weights(self, stimuli, response, actual_ro, reward, valence, gating_signal):  # Added target_valence and gating_signal
         """Update all weights based on experience"""
         # Get current predictions
-        ro_predictions = self.compute_ro_prediction(stimuli)
+        ro_predictions = self.compute_ro_prediction(stimuli) # Get expected valence
         temporal_prediction = self.compute_temporal_prediction()
         
         # Compute surprise
         omega_p, omega_n = self.compute_surprise(ro_predictions, actual_ro)
-        
-        # Update R-O conjunction weights (equations 1-3)
+
+        # Compute effective learning rate
         effective_lr = self.compute_effective_learning_rate(omega_p, omega_n)
-        ro_error = (self.theta * actual_ro - ro_predictions) * outcome_valence
-
-        print(f" old w_s{self.W_S.data}")
-
-        print(f" effective lr {effective_lr}")
-
-        self.W_S.data += gating_signal * effective_lr * torch.outer(ro_error, stimuli)
-
-        print(f" new w_s{self.W_S.data}")
         
-        # Update temporal prediction weights
-        td_error = (reward + 
-                   self.gamma * self.compute_temporal_prediction() - 
-                   temporal_prediction)
+        self.update_prediction_weights(stimuli, effective_lr, actual_ro, ro_predictions, gating_signal)
+
+        # Update temporal prediction weights (Equation 9)
+        td_error = (reward + self.gamma * self.compute_temporal_prediction() - temporal_prediction) # Equation 7
         td_error = td_error.reshape(-1, 1, 1)
-        self.U.data += (self.alpha_td * td_error * self.eligibility_trace)
+        self.U.data += (self.alpha_td * td_error * self.eligibility_trace)  # Equation 9
         self.U.data.clamp_(-1, 1)
-        
-        # Update proactive control weights (equation 12)
-        response_mask = (response > 0.1).float()
-        delta_w_f = (0.01 * torch.outer(response_mask, actual_ro) * 
-                    outcome_valence)
-        self.W_F.data += gating_signal * delta_w_f
+        self.U.data.clamp_(-1, 1)
 
-        # Update reactive control weights (equation 13)
-        delta_w_r = (outcome_valence * # Y_i is outcome_valence
-                               torch.outer(response_mask, omega_n))
-        self.W_R.data = 0.25 * (self.W_R + gating_signal * delta_w_r) # Added gating
+        # Update proactive control weights (equation 14)
+        response_mask = (response > self.response_threshold).float()
+        delta_w_f = 0.01 * torch.outer(actual_ro, response_mask) * valence * gating_signal # Include gating signal
+        self.W_F.data += delta_w_f
+
+        # Update reactive control weights (Equation 4 - with gating signal)
+        delta_w_r = valence * torch.ger(response, omega_n) * gating_signal # Include valence and gating signal
+        self.W_R.data = 0.25 * (self.W_R + delta_w_r)
         self.W_R.data.clamp_(-1, 1)
-
-        # Update Outcome Representation weights (using MSE loss)
-        predicted_valence = self.outcome_rep(stimuli)
-        valence_loss = F.mse_loss(predicted_valence, outcome_valence)
-        self.optimizer_or.zero_grad() # Zero the optimizer's gradients
-        valence_loss.backward(retain_graph=True) # Backpropagate the loss
-        self.optimizer_or.step() # Update the weights
         
         return {
             'omega_p': omega_p,
             'omega_n': omega_n,
-            'ro_error': ro_error,
             'td_error': td_error,
-            'valence_loss': valence_loss
         }
 
 class GoNoGoTask:
@@ -368,7 +353,6 @@ class GoNoGoTrainer:
         self.model = model
         self.task = task
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        self.model.optimizer_or = optim.Adam(model.outcome_rep.parameters(), lr=or_learning_rate)
         # Metrics tracking
         self.metrics = defaultdict(list)
         
@@ -398,11 +382,9 @@ class GoNoGoTrainer:
     def run_trial(self, stimulus, correct_response, is_go_trial=None):
         """Run a single trial"""
         self.optimizer.zero_grad()
-        self.model.optimizer_or.zero_grad() # Zero grad for outcome rep optimizer
-
 
         # Forward pass
-        response, pred_outcomes, pred_temporal, response_discrete = self.model(stimulus)
+        response, pred_outcomes, pred_temporal, response_discrete = self.model(stimulus) # Call forward ONLY ONCE
 
         # Evaluate response
         eval_results = self.evaluate_response(response, correct_response)
@@ -413,46 +395,36 @@ class GoNoGoTrainer:
         outcome_idx = 0 if eval_results['correct'] else 1
         actual_outcomes[response_idx * self.task.n_outcomes + outcome_idx] = 1.0
 
-        # Reward (task-specific - needs to be implemented for each task)
-        reward = 1.0 if eval_results['correct'] else -0.5  # Placeholder - replace with task-specific reward
-        reward = torch.tensor([reward], device=device).float()
-
-        # Outcome valence (task-specific)
-        outcome_valence = actual_outcomes.clone().detach()  # Placeholder - replace with task-specific valence
-        # Important: Detach outcome_valence to avoid double gradients through OutcomeRepresentation
+        # Reward and Valence (task-specific - needs to be implemented for each task)
+        reward, valence = self.get_reward_valence(eval_results, is_go_trial)
+        # Important: Detach valence to avoid double gradients through OutcomeRepresentation
 
         # Gating signal
-        gating_signal = 1.0  # Placeholder - can be task-specific
+        gating_signal = 1.0
 
-        # Update weights (get losses from here)
-        update_results = self.model.update_weights(stimulus, response, actual_outcomes, reward, outcome_valence, gating_signal)
-
-        # Calculate actual_values (task-specific - depends on timing of outcomes)
+        # Calculate expected_valence (task-specific - depends on timing of outcomes)
         actual_values = reward + self.model.gamma * self.model.compute_temporal_prediction() # Placeholder - replace with task-specific target
         actual_values = actual_values.detach() # Detach to avoid gradients through temporal prediction pathway
 
+        # Update weights (get losses from here)
+        update_results = self.model.update_weights(stimulus, response, actual_outcomes, reward, valence, gating_signal)
+
         # Compute losses (using update_results)
-        losses = self.model.compute_losses(response, pred_outcomes, pred_values,
-                                         actual_outcomes, actual_values)
+        losses = self.model.compute_losses(response, pred_outcomes, pred_temporal, actual_outcomes)
+        losses = {k: v.item() for k, v in losses.items()} # Convert to items
         
-        # Backward pass
-        losses = {
-            'total_loss': update_results['ro_loss'] + update_results['td_loss'] + update_results['valence_loss'],
-            'ro_loss': update_results['ro_loss'].item(),
-            'td_loss': update_results['td_loss'].item(),
-            'valence_loss': update_results['valence_loss'].item()
-        }
-
-        # Backward pass (on total_loss only)
-        update_results['ro_loss'].backward(retain_graph=True) # Backpropagate ro_loss
-        update_results['td_loss'].backward(retain_graph=True) # Backpropagate td_loss
-        update_results['valence_loss'].backward() # Backpropagate valence loss
-
-        self.optimizer.step()
-        self.model.optimizer_or.step() # Update outcome representation weights
+        # Backward pass would go here if we weren't manually updating...
 
         return losses, eval_results
 
+    def get_reward_valence(self, eval_results, is_go_trial):
+        """Get reward and valence - Task-Specific implementation"""
+        if isinstance(self.task, GoNoGoTask):
+            reward = 1.0 if eval_results['correct'] else -0.5
+            valence = torch.tensor([reward], device=device).float()
+            return reward, valence
+        # ... (Implement for other tasks)
+        return 0.0, torch.tensor([0.0], device=device).float()  # Default
 
     def train_epoch(self, n_trials):
         """Train for one epoch"""
@@ -462,9 +434,11 @@ class GoNoGoTrainer:
             # Foraging task specific logic
             for _ in range(n_trials):
                 stimulus, engage_values, forage_values = self.task.generate_trial()
-                stimulus = stimulus.to(device)
+                stimulus = stimulus.to(device).float()
 
-                # ... (Foraging task specific training logic)
+                correct_response = torch.tensor([0.0, 1.0], device=device) if np.mean(forage_values) > np.mean(engage_values) else torch.tensor([1.0, 0.0], device=device)
+                losses, eval_results = self.run_trial(stimulus, correct_response)
+
         elif isinstance(self.task, RiskAvoidanceTask):
             # Risk avoidance task specific logic
             for _ in range(n_trials):
@@ -497,7 +471,7 @@ class GoNoGoTrainer:
                 # Record metrics
                 for key in losses:
                     epoch_metrics[key].append(losses[key])
-                epoch_metrics['loss'].append(losses['total_loss'].item())
+                epoch_metrics['loss'].append(losses['total_loss'])
                 epoch_metrics['correct'].append(float(eval_results['correct']))
                 epoch_metrics['hit'].append(float(eval_results['hit']))
                 epoch_metrics['miss'].append(float(eval_results['miss']))

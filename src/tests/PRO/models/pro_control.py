@@ -90,7 +90,7 @@ class PROControlModel():
     
     def compute_temporal_prediction(self):
         """Compute temporal prediction (V) based on stimulus history"""
-        self.V = np.sum(self.U * self.eligibility_trace, axis=(1, 2))
+        self.V = np.sum(self.U * self.delay_chain, axis=(1, 2))
         if self.V.shape != (self.n_ro_conjunctions,):
             print("Compute temporal returning incorrect dimensions for value:")
             print(f"V: {self.V.shape}")

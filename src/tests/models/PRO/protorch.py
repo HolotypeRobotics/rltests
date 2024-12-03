@@ -88,7 +88,7 @@ class PROControl(nn.Module):
             if norm_factor > 1:
                 self.W_F.data /= norm_factor
 
-    def compute_losses(self, *args): # No valence loss now
+    def compute_losses(self, *args):
         return {'total_loss': torch.tensor(0.0, requires_grad=True)} # Dummy loss
 
     # PRO Eq. (3)
@@ -532,7 +532,7 @@ class GoNoGoTrainer:
         return fig
 
 # Example usage
-def run_experiment(task, n_epochs=100, trials_per_epoch=100, n_delay_units=20):
+def run_experiment(task, n_epochs=100, trials_per_epoch=10, n_delay_units=20):
     
     # Initialize model
     model = PROControl(

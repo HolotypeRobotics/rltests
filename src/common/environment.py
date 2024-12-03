@@ -32,6 +32,43 @@ class Environment:
         self.exit = (len(rewards) - 1, len(rewards[0]) - 1)
         self.path = []
 
+    def step(self, action):
+        if len(self.path) == 0:
+            self.path.append(self.state)
+
+        if self.state == self.exit:
+            if np.random.rand() < 0.5:
+                self.done = True
+            # self.done = True
+
+        elif action == Action.UP:
+            self.state = (max(self.state[0] - 1, 0), self.state[1])
+
+        elif action == Action.DOWN:
+            self.state = (min(self.state[0] + 1,
+                                                self.rewards.shape[0] - 1), self.state[1])
+
+        elif action == Action.LEFT:
+            self.state = (self.state[0], max(self.state[1] - 1, 0))
+
+        elif action == Action.RIGHT:
+            self.state = (self.state[0],
+                                        min(self.state[1] + 1, self.rewards.shape[1] - 1))
+
+        elif action == None:
+            print("No action taken")
+            pass
+
+        else:
+            raise ValueError(f"Invalid action: {action}")
+
+        self.path.append(self.state)
+
+        self.reward = self.rewards[self.state]
+
+        return np.array(self.state_to_sdr(),
+                                        dtype=int), self.reward, self.done, self.state
+
     def state_to_sdr(self):
         y = np.zeros(self.rewards.shape[0])
         y[self.state[0]] = 1
@@ -138,43 +175,6 @@ class Environment:
 
     def reset_path(self):
         self.path = []
-
-    def step(self, action):
-        if len(self.path) == 0:
-            self.path.append(self.state)
-
-        if self.state == self.exit:
-            if np.random.rand() < 0.5:
-                self.done = True
-            # self.done = True
-
-        elif action == Action.UP:
-            self.state = (max(self.state[0] - 1, 0), self.state[1])
-
-        elif action == Action.DOWN:
-            self.state = (min(self.state[0] + 1,
-                                                self.rewards.shape[0] - 1), self.state[1])
-
-        elif action == Action.LEFT:
-            self.state = (self.state[0], max(self.state[1] - 1, 0))
-
-        elif action == Action.RIGHT:
-            self.state = (self.state[0],
-                                        min(self.state[1] + 1, self.rewards.shape[1] - 1))
-
-        elif action == None:
-            print("No action taken")
-            pass
-
-        else:
-            raise ValueError(f"Invalid action: {action}")
-
-        self.path.append(self.state)
-
-        self.reward = self.rewards[self.state]
-
-        return np.array(self.state_to_sdr(),
-                                        dtype=int), self.reward, self.done, self.state
 
     def close(self):
         pass

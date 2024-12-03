@@ -1,0 +1,118 @@
+
+\usepackage{amsmath}
+
+\title{The PRO-Control Model: A Summary}
+\author{Your Name}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+
+The Predicted Response-Outcome (PRO) model (Alexander \& Brown, 2011) provides a framework for understanding the role of the anterior cingulate cortex (ACC) in performance monitoring and cognitive control. The PRO-control model (Brown \& Alexander, this issue) extends the PRO model to account for value-based decision-making by incorporating proactive and reactive control mechanisms.
+
+\section{The PRO Model}
+
+The PRO model learns to predict conjunctions of responses and outcomes based on incoming stimuli.  It consists of three main components: Actor, Critic, and Controller.
+
+\subsection{Outcome Representation}
+
+The Controller learns a prediction of response-outcome conjunctions ($S_{i,t}$) based on task-related stimuli ($D_{j,t}$):
+
+\begin{equation}
+S_{i,t} = \sum_j D_{j,t} W^S_{ij,t}
+\end{equation}
+
+where $W^S_{ij,t}$ are the weights connecting stimuli $j$ to predicted response-outcome conjunction $i$.  These weights are updated according to:
+
+\begin{equation}
+W^S_{ij,t+1} = W^S_{ij,t} + A_{i,t}(O_{i,t} - S_{i,t})G D_{j,t}
+\end{equation}
+
+where $O_{i,t}$ is the actual response-outcome conjunction, $G$ is a gating signal (1 for behaviorally relevant events, 0 otherwise), and $A_{i,t}$ is a learning rate modulated by surprise:
+
+\begin{equation}
+A_{i,t} = \frac{\alpha}{1 + (\omega^P_{i,t} + \omega^N_{i,t})}
+\end{equation}
+
+where $\alpha$ is a baseline learning rate, and $\omega^P_{i,t}$ and $\omega^N_{i,t}$ are positive and negative surprise signals, respectively (defined later).
+
+\subsection{Temporal Difference Model of Outcome Prediction}
+
+The Critic learns a timed prediction ($V_{i,t}$) of response-outcome conjunctions.  The temporal difference error ($\delta_{i,t}$) is calculated as:
+
+\begin{equation}
+\delta_{i,t} = r_{i,t} + \gamma V_{i,t+1} - V_{i,t}
+\end{equation}
+
+where $r_{i,t}$ is a function of observed response-outcome conjunctions, and $\gamma$ is a temporal discount factor.  The timed prediction is calculated as:
+
+\begin{equation}
+V_{i,t} = \sum_{j,k} X_{jk,t} U_{ijk,t}
+\end{equation}
+
+where $X_{jk,t}$ is an eligibility trace, and $U_{ijk,t}$ are learned prediction weights, updated according to:
+
+\begin{equation}
+U_{ijk,t+1} = U_{ijk,t} + \alpha \delta_{i,t} X_{jk,t}
+\end{equation}
+
+\subsection{Surprise Signals}
+
+Positive and negative surprise signals are calculated based on the difference between predicted and actual outcomes:
+
+\begin{equation}
+\omega^P_{i,t} = [O_{i,t} - V_{i,t}]^+
+\end{equation}
+
+\begin{equation}
+\omega^N_{i,t} = [V_{i,t} - O_{i,t}]^+
+\end{equation}
+
+where $[x]^+$ denotes the positive part of $x$ (i.e., $\max(0, x)$).
+
+
+\section{The PRO-Control Model}
+
+The PRO-control model extends the PRO model with three modifications:
+
+\subsection{Predicting Bad Outcomes}
+
+The Controller now learns to predict R-O conjunctions in proportion to how bad the outcome would be, using $\theta$ as a scaling factor for outcome valence:
+
+\begin{equation}
+W^S_{ij,t+1} = W^S_{ij,t} + A_{i,t} (\theta O_{i,t} - S_{i,t})G D_{j,t}
+\end{equation}
+
+
+\subsection{Proactively Driving Good Actions}
+
+The Controller can now exert both inhibitory and excitatory influence on the Actor, allowing it to proactively drive actions:
+
+\begin{equation}
+E_{i,t} = \rho \left( \sum_j D_{j,t} W^C_{ij} + \sum_k [-S_{k,t}W^F_{ik,t}]^+ + \sum_j [-W^R_{ij,t}]^+ \right)
+\end{equation}
+
+\begin{equation}
+I_{i,t} = \psi \left( \sum_j [\phi S_{k,t} W^F_{ik,t}]^+ + \sum_j [W^R_{ij,t}]^+ \right)
+\end{equation}
+
+where $E_{i,t}$ and $I_{i,t}$ represent excitatory and inhibitory inputs to response unit $i$, $W^C$ are fixed S-R weights, $W^F$ are learned top-down control weights, $W^R$ are reactive control weights (defined below), and $\rho$, $\phi$, and $\psi$ are scaling factors.
+
+\subsection{Reactively Suppressing Bad Actions}
+
+Negative surprise signals now directly influence the Actor through rapidly decaying inhibitory weights:
+
+\begin{equation}
+W^R_{ij,t+1} = 0.25 W^R_{ij,t} + Y_i T_{i,t} \omega^N_{j,t}
+\end{equation}
+
+where $Y_i$ is an affective evaluation of the outcome, and $T_{i,t}$ is 1 if action $i$ was executed and 0 otherwise.
+
+\section{Conclusion}
+
+The PRO-control model provides a comprehensive framework for understanding how ACC contributes to value-based decision-making by integrating proactive and reactive control mechanisms within a reinforcement learning framework.  This model accounts for a wide range of empirical findings and offers new predictions for future research.
+
+\end{document}

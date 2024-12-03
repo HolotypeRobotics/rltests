@@ -21,9 +21,9 @@ class WM_Gate(nn.Module):
         store = torch.bernoulli(prob_store)
 
         # Enforce one-item capacity:
-        r = store * s  # If store = 1, keep s, otherwise WM is empty (one-hot)
+        # r = store * s  # If store = 1, keep s, otherwise WM is empty (one-hot)
         # If you want to maintain the previous item if not storing a new one, uncomment the line below
-        # r += (1 - store) * r_prev  # If store = 0, keep r_prev
+        r = store * s + (1 - store) * r_prev  # If store = 0, keep r_prev
 
         return r, prob_store
 
@@ -33,12 +33,8 @@ class HERLayer(nn.Module):
         self.W = nn.Parameter(torch.randn(n_representations, n_outcomes))  # (Eq. 2.1, 2.3) Initialize with random values
         self.alpha = alpha # (Eq. 2.3)
 
-    def forward(self, r, m_from_above=None): # Add top-down modulation
-        if m_from_above is not None:
-            m = torch.matmul(self.W + m_from_above, r)  # Apply top-down modulation before prediction (Eq. 2.9, 2.10)
-            p = m #  m is the prediction in this case (Eq. 2.10)
-        else:
-            p = torch.matmul(self.W.T, r)  # Prediction without modulation (Eq. 2.1)
+    def forward(self, r): # Add top-down modulation
+        p = torch.matmul(self.W.T, r)  # Prediction without modulation (Eq. 2.1)
 
         return p
 
@@ -52,6 +48,7 @@ class HER(nn.Module):
         self.n_layers = n_layers
         self.n_representations = n_representations
         self.n_outcomes = n_outcomes
+        self.n_responses = n_responses
         self.gamma = gamma
 
         # Working Memory and Gating Mechanisms
@@ -61,17 +58,17 @@ class HER(nn.Module):
 
         # Layer Modules
         self.layers = nn.ModuleList([HERLayer(n_representations, n_outcomes, alphas_layer[i]) for i in range(n_layers)])
-
-        # Response Selection (Output Layer - only at the lowest layer)
-        self.W_response = nn.Parameter(torch.randn(n_representations, n_responses)) # n_outcomes x n_responses
+        self.W_response = nn.Parameter(torch.randn(n_outcomes, n_responses)) # Output weights for response selection
         self.lambdas = lambdas if lambdas is not None else [0.1, 0.5, 0.99]
 
 
     def forward(self, s, a_index, o):
-        errors = []
-        modulations = []
-        rs = []
-        o_prime = None
+        errors = [] 
+        modulations = [] # upper layer output used to modulate current layer
+        rs = [] # values currently held in working memory
+        o_prime = None # target values for the upper layer
+        n_actions = o.shape[0] # Get number of possible actions from outcome shape
+
 
         # Process each layer hierarchically
         for i in range(self.n_layers):
@@ -79,8 +76,8 @@ class HER(nn.Module):
             r, prob_store = self.WM_gates[i](s, r_prev, self.eligibility_traces[i])
             rs.append(r)
             self.WM[i] = r  # Update working memory
-            # Update eligibility trace (Eq. after 2.6)
-            self.eligibility_traces[i] = self.lambdas[i] * self.eligibility_traces[i] + (1 - self.lambdas[i]) * s # Update with *s*
+            # Update eligibility trace (Eq. 2.6) Xt+1 = Xt + (etT Wt · rt )dtT. The dot means element-wise multiplication
+            self.eligibility_traces[i] = self.lambdas[i] * self.eligibility_traces[i] + s  # Decay and add current stimulus
             # Top-down modulation (Eq. 2.9, 2.10)
             modulation_from_above = None
             if i < self.n_layers - 1:
@@ -88,36 +85,35 @@ class HER(nn.Module):
                 modulation_from_above = p_higher.reshape(self.n_representations, self.n_outcomes)  # Reshape for additive modulation
                 modulations.append(modulation_from_above)
 
-            p = self.layers[i](r, modulation_from_above)
-
+            p = self.layers[i](r)  # Predictions *before* modulation
+            # Apply top-down modulation to predictions
+            if modulation_from_above is not None:
+                p = p + torch.flatten(modulation_from_above) # Apply modulation to predictions
 
             if i == 0: # Lowest layer uses actual outcome (Eq. 2.2)
                 # Filter error based on selected action. Create a one-hot vector for the action:
-                a = torch.zeros(self.n_outcomes)  # Assuming n_outcomes = number of possible actions x number of feedback types
+                a = torch.zeros(n_actions)
                 a[a_index] = 1.0
                 e = a * (o - p)  # (Eq. 2.2)
-                o_prime = torch.outer(r, e)  # (Eq. 2.7)
+                o_prime = torch.outer(r, e.T)  # (Eq. 2.7) O' = reT
+
             else: # Higher layers use error from below as outcome (Eq. 2.8, 2.11)
                 o_higher = torch.flatten(o_prime) # Flatten o_prime from previous layer
-                e = (o_higher - p) # Error at higher layers # (Eq. 2.8, 2.11)
+                a_higher = torch.zeros_like(p) # Placeholder for action vector at higher levels (needs to be defined based on task)
+                e = a_higher * (o_higher - p) # Error at higher layers # (Eq. 2.8, 2.11) e' = a'(o' − p' ).
                 if i < self.n_layers - 1: # Only calculate o_prime if not the top layer
-                    o_prime = torch.outer(r, e)
+                    o_prime = torch.outer(r, e.T)
 
             errors.append(e)
             self.layers[i].update_weights(e, r) # Update layer weights (Eq. 2.3)
             # Update gating weights AFTER error calculation
-            self.WM_gates[i].X.data += self.WM_gates[i].alpha * torch.outer(e, self.eligibility_traces[i]) # Update gating weights (eq. 2.6)
-
-        # # Response Selection (Eq. 2.12, 2.13)
-        # #  Important: The paper uses separate predictions for Correct and Error outcomes to drive response selection.
-        # response_correct = self.layers[0](r, modulation_from_above)[:, 0] # Predictions for correct outcome
-        # response_error = self.layers[0](r, modulation_from_above)[:, 1] # Predictions for error outcome
-        # u = response_correct - response_error # Difference in predictions
-
-        # response_probabilities = F.softmax(self.gamma * u, dim=0) # Softmax for response selection
+            self.WM_gates[i].X.data += self.WM_gates[i].alpha * torch.outer(torch.matmul(e, self.layers[i].W.T), self.eligibility_traces[i]) # (Eq. 2.6)
 
         # Response Selection (using separate predictions for correct/error)
-        p_lowest = self.layers[0](rs[0], modulations[0] if len(modulations) > 0 else None)
+        p_lowest = self.layers[0](rs[0])
+        if len(modulations) > 0:
+            p_lowest = p_lowest + torch.flatten(modulations[0])
+
         response_logits = torch.matmul(p_lowest, self.W_response)  # Get logits for each response
         response_probabilities = F.softmax(self.gamma * response_logits, dim=0)  # Softmax over responses (Eq. 2.13)
 

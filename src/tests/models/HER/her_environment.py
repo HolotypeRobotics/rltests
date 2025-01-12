@@ -1,6 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors
+import torch
+import torch.nn.functional as F
+
 
 class Action:
     TURN_LEFT = 0
@@ -24,33 +27,62 @@ class Environment:
         else:
             raise ValueError("Invalid action")
 
-    def __init__(self, n_rewards, n_efforts, n_objects):
-        self.rewards = np.array(n_rewards)
+    def __init__(self, width, height, n_rewards, n_efforts, n_objects): # Added default dimensions and objects
+        self.width = width
+        self.height = height
+        self.n_objects = n_objects
+        self.rewards = np.zeros((height, width)) # Initialize rewards to zero
+        self.objects = np.zeros((height, width), dtype=int) # Initialize objects to zero
         self.efforts = np.array(n_efforts)
-        self.objects = np.array(n_objects)
         self.state = (0, 0)
         self.direction = Direction.EAST
+        self.exit = (height - 1, width - 1) # Bottom-right corner
+        self.place_objects() # Place objects randomly
         self.object_positions = self.find_object_positions()
         self.distances = self.calculate_distances()
         self.reward = 0
         self.effort = 0
         self.done = False
-        self.exit = (len(n_rewards) - 1, len(n_rewards[0]) - 1)
         self.path = []
 
-    def state_to_sdr(self):
-        y = np.zeros(self.rewards.shape[0])
-        y[self.state[0]] = 1
-        x = np.zeros(self.rewards.shape[1])
-        x[self.state[1]] = 1
-        return np.concatenate((x, y))
+        # Precompute SDRs for efficiency
+        self.state_sdrs = {}
+        for y in range(self.height):
+            for x in range(self.width):
+                self.state_sdrs[(y, x)] = self._coord_to_sdr(x, y)
+        self.direction_sdrs = {
+            Direction.NORTH: np.array([1, 0, 0, 0]),
+            Direction.EAST: np.array([0, 1, 0, 0]),
+            Direction.SOUTH: np.array([0, 0, 1, 0]),
+            Direction.WEST: np.array([0, 0, 0, 1])
+        }
 
-    def coord_to_sdr(self, x, y):
-        _y = np.zeros(self.rewards.shape[0])
-        _y[y] = 1
-        _x = np.zeros(self.rewards.shape[1])
-        _x[x] = 1
-        return np.concatenate((_x, _y))
+    def place_objects(self):
+        # Place objects randomly (excluding start and exit)
+        available_positions = [(y, x) for y in range(self.height) for x in range(self.width) if (y, x) != (0, 0) and (y, x) != self.exit]
+        object_positions = np.random.choice(len(available_positions), size=self.n_objects, replace=False)
+        for i, idx in enumerate(object_positions):
+            self.objects[available_positions[idx]] = i + 1 # Assign unique object IDs
+
+    def _coord_to_sdr(self, x, y):
+        # Helper function (no change in logic, just renaming)
+        sdr = np.zeros(self.width + self.height)
+        sdr[y] = 1
+        sdr[self.height + x] = 1
+        return sdr 
+
+    def state_to_sdr(self):
+        # One-hot encode location
+        y = F.one_hot(torch.tensor(self.state[0]), num_classes=self.rewards.shape[0]).float()
+        x = F.one_hot(torch.tensor(self.state[1]), num_classes=self.rewards.shape[1]).float()
+
+        # One-hot encode direction
+        direction_sdr = F.one_hot(torch.tensor(self.direction), num_classes=4).float()
+
+        distances_sdr = self.distances / np.linalg.norm(self.distances) # Normalize distances
+
+        s = torch.cat([x, y, distances_sdr, direction_sdr], dim=0)
+        return s
 
     def state_to_matrix(self):
         mat = np.zeros(self.rewards.shape)
@@ -62,14 +94,40 @@ class Environment:
         mat[y, x] = 1
         return mat
 
+    def state_to_one_hot(self, state):
+        size = self.rewards.shape[0] * self.rewards.shape[1]
+        one_hot = np.zeros(size)
+        index = state[0] * self.rewards.shape[1] + state[1]
+        one_hot[index] = 1
+        return one_hot
+
+    def direction_to_one_hot(self, direction):
+        one_hot = np.zeros(4)
+        one_hot[direction] = 1
+        return one_hot
+
+    def proximity_to_one_hot(self, distance, n_bins=3, max_distance=None):
+        if max_distance is None:
+            max_distance = np.max(self.rewards.shape) * np.sqrt(2) # Diagonal
+        bins = np.linspace(0, max_distance, n_bins + 1)
+        bin_index = np.digitize(distance, bins) - 1 # Subtract 1 to make indices 0-based
+        one_hot = np.zeros(n_bins)
+        one_hot[min(bin_index, n_bins - 1)] = 1 # Ensure index is within bounds
+        return one_hot
+
+    def action_to_one_hot(self, action):
+        one_hot = np.zeros(3)
+        one_hot[action] = 1
+        return one_hot
+
     def reset(self):
         self.state = (0, 0)
         self.direction = Direction.EAST
         self.reward = 0  # No reward on reset
         self.effort = 0
         self.done = False
-        distances = self.calculate_distances()
-        return np.array(self.state_to_sdr(), dtype=int), self.reward, self.effort, self.direction, distances
+        self.path = []
+        return self.get_outputs()
 
     def set_effort(self, x, y, effort):
         self.efforts[y, x] = effort
@@ -89,9 +147,14 @@ class Environment:
         return object_positions
 
     def calculate_distances(self):
-        distances = np.zeros(len(self.object_positions))
-        for i, (obj, pos) in enumerate(self.object_positions.items()):
-            distances[i] = np.linalg.norm(np.array(self.state) - pos)
+        distances = np.zeros(self.n_objects)
+        for i in range(self.n_objects):
+            object_positions = np.argwhere(self.objects == i + 1)
+            if len(object_positions) > 0:
+                distances[i] = np.linalg.norm(np.array(self.state) - object_positions[0])
+            else: # Handle cases where an object might not be present
+                distances[i] = -1 # Or some other sentinel value
+
         return distances
 
     def render(self):
@@ -151,19 +214,26 @@ class Environment:
 
     def reset_path(self):
         self.path = []
+        self.effort = 0  # Reset effort
+        self.reward = 0  # Reset reward
+
+    def get_outputs(self):
+        self.distances = self.calculate_distances()
+
+        state_one_hot = self.state_to_one_hot(self.state)
+        direction_one_hot = self.direction_to_one_hot(self.direction)
+        proximity_one_hots = np.array([self.proximity_to_one_hot(d) for d in self.distances])
+        previous_action_one_hot = self.action_to_one_hot(0) # Initialize with no previous action
+        s = np.concatenate([state_one_hot, direction_one_hot, proximity_one_hots.flatten(), previous_action_one_hot])
+
+        return s, self.reward, self.done
 
     def step(self, action):
         if len(self.path) == 0:
             self.path.append(self.state)
 
         if self.state == self.exit:
-            if np.random.rand() < 0.5:
-                self.done = True
-
-        old_state = self.state
-        moved = False
-        self.effort = 0  # Reset effort
-        self.reward = 0  # Reset reward
+            self.done = True
 
         if action == Action.TURN_LEFT:
             self.direction = (self.direction - 1) % 4
@@ -192,10 +262,8 @@ class Environment:
 
         if moved:
             self.path.append(self.state)
-
-        self.distances = self.calculate_distances()
-
-        return np.array(self.state_to_sdr(), dtype=int), self.reward, self.done, self.state, self.effort, self.direction, self.distances
-
+        
+        return self.get_outputs()
+        
     def close(self):
         pass

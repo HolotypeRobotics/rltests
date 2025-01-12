@@ -1,120 +1,164 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim  # For optimization
 
 class WM_Gate(nn.Module):
-    def __init__(self, n_stimuli, n_representations, beta=15, bias=0.1, alpha=0.075):
+    def __init__(self, n_stimuli, beta, bias, alpha, lambda_):
         super(WM_Gate, self).__init__()
-        self.X = nn.Parameter(torch.zeros(n_stimuli, n_representations))  # (Eq. 2.4, 2.6)
-        self.beta = nn.Parameter(torch.tensor(beta)) # (Eq. 2.5)
-        self.bias = nn.Parameter(torch.tensor(bias)) # (Eq. 2.5)
-        self.alpha = alpha  # Learning rate for X (Eq. 2.6)
+        self.X = nn.Parameter(torch.zeros(n_stimuli))  # (Eq. 2.4, 2.6)
+        self.beta = beta
+        self.bias = bias
+        self.alpha = alpha
+        self.lambda_ = lambda_ # Eligibility trace decay rate
 
-    def forward(self, s, r_prev, eligibility_trace):
+    def forward(self, s, r_prev, layer_idx):
         v = torch.matmul(self.X.T, s)  # Value of storing current stimulus s (Eq. 2.4)
         v_prev = torch.matmul(self.X.T, r_prev)  # Value of maintaining previous item (Eq. 2.4)
+        # Missing decay for eligibiltiy trace?
 
         # Probabilistic gating (softmax) (Eq. 2.5)
-        prob_store = (torch.exp(self.beta * v) + self.bias) / (torch.exp(self.beta * v) + self.bias + torch.exp(self.beta * v_prev))
-        
-        # Sample from the probability distribution (using Bernoulli)
-        store = torch.bernoulli(prob_store)
+        prob = (torch.exp(self.beta * v) + self.bias) / (torch.exp(self.beta * v) + self.bias + torch.exp(self.beta * v_prev))
+        prob_dist = torch.distributions.Bernoulli(probs=prob)  # Create a Bernoulli distribution
+        r = prob_dist.sample() * s + (1 - prob_dist.sample()) * r_prev  # Sample and update WM
 
-        # Enforce one-item capacity:
-        # r = store * s  # If store = 1, keep s, otherwise WM is empty (one-hot)
-        # If you want to maintain the previous item if not storing a new one, uncomment the line below
-        r = store * s + (1 - store) * r_prev  # If store = 0, keep r_prev
-
-        return r, prob_store
+        return r
+    
+    # Update weights (Eq. 2.6)
+    def update_weights(self, e, W, r, d):
+            self.X.data += torch.outer(torch.matmul(e, W.T), r) * d.unsqueeze(1)
 
 class HERLayer(nn.Module):
-    def __init__(self, n_representations, n_outcomes, alpha=0.075): # n_stimuli not needed here
+    def __init__(self, n_inputs, n_outputs, alpha=0.075): # n_stimuli not needed here
         super(HERLayer, self).__init__()
-        self.W = nn.Parameter(torch.randn(n_representations, n_outcomes))  # (Eq. 2.1, 2.3) Initialize with random values
+        self.W = nn.Parameter(torch.randn(n_inputs, n_outputs))  # (Eq. 2.1, 2.3) Initialize with random values
         self.alpha = alpha # (Eq. 2.3)
 
-    def forward(self, r): # Add top-down modulation
-        p = torch.matmul(self.W.T, r)  # Prediction without modulation (Eq. 2.1)
+    def forward(self, r, wm_mask, modulation=None):  # Added modulation
+        p = torch.matmul(self.W.T, r)  # Predictions (Eq. 2.1)
 
+        if modulation is not None:
+            # Implement additive modulation (Eq. 2.9, 2.10)
+            modulation = modulation.view(self.W.shape) # Reshape modulation to match W
+            masked_modulation = modulation * wm_mask.unsqueeze(1) # Unsqueeze for broadcasting
+            p = p + torch.matmul(masked_modulation.T, r) # Additive modulation
+        
         return p
 
-    def update_weights(self, e, r):
-        self.W.data += self.alpha * torch.outer(e, r)  # Update weights (Eq. 2.3)
+    def update_weights(self, e, r, ):
+        self.W.data += self.alpha * torch.outer(e, r) # Update weights (Eq. 2.3)
 
 
 class HER(nn.Module):
-    def __init__(self, n_layers, n_stimuli, n_outcomes, n_representations, n_responses, betas, biases, alphas_gate, alphas_layer, gamma=10, lambdas=None):
+    def __init__(self, n_layers, n_hidden, n_stimuli, n_outcomes, n_responses, beta, bias, gate_alpha, layer_alpha, gamma, lambda_):
         super(HER, self).__init__()
         self.n_layers = n_layers
-        self.n_representations = n_representations
-        self.n_outcomes = n_outcomes
-        self.n_responses = n_responses
-        self.gamma = gamma
+        self.n_stimuli = n_stimuli # Now takes state dimension directly
+        self.gamma = gamma # Softmax temperature
+        self.lambda_ = lambda_ # Eligibility trace decay rate
+        self.layers = nn.ModuleList()
 
         # Working Memory and Gating Mechanisms
-        self.WM_gates = nn.ModuleList([WM_Gate(n_stimuli, n_representations, betas[i], biases[i], alphas_gate[i]) for i in range(n_layers)])
-        self.register_buffer('WM', torch.zeros(n_layers, n_representations))
+        self.WM_gates = nn.ModuleList([WM_Gate(n_stimuli, beta, bias, gate_alpha, lambda_) for i in range(n_layers)])
+        self.register_buffer('WM', torch.randint(0, n_stimuli, (n_layers,))) # Corrected shape 
         self.register_buffer('eligibility_traces', torch.zeros(n_layers, n_stimuli))
 
         # Layer Modules
-        self.layers = nn.ModuleList([HERLayer(n_representations, n_outcomes, alphas_layer[i]) for i in range(n_layers)])
-        self.W_response = nn.Parameter(torch.randn(n_outcomes, n_responses)) # Output weights for response selection
-        self.lambdas = lambdas if lambdas is not None else [0.1, 0.5, 0.99]
+        self.layers.append(HERLayer(n_responses, n_outcomes)) # First layer is output layer
+        
+        for i in range(1, n_layers):
+            self.layers.append(HERLayer(n_responses, n_hidden))
 
+        # Response Selection
+        self.W_response = nn.Parameter(torch.randn(n_responses))
+        self.response_optimizer = optim.Adam([self.W_response], lr=layer_alpha) # Optimizer for response selection weights
 
-    def forward(self, s, a_index, o):
-        errors = [] 
-        modulations = [] # upper layer output used to modulate current layer
-        rs = [] # values currently held in working memory
-        o_prime = None # target values for the upper layer
-        n_actions = o.shape[0] # Get number of possible actions from outcome shape
+        # Optimizers (one for each WM_Gate)
+        self.optimizers = nn.ModuleList([optim.Adam(self.WM_gates[i].parameters(), lr=gate_alpha) for i in range(self.n_layers)])
+    
+    # Layer 0 is bottom (output) layer
+    # Highest layer is input
+    def forward(self, s):
+        rs = []
+        ps = []
+        modulation = None
 
+        for i in range(self.n_layers - 1, -1, -1):
+            r_prev_index = self.WM[i]  # Get WM index
+            r_prev = F.one_hot(r_prev_index.long().unsqueeze(0), num_classes=self.n_stimuli).float() # One-hot encode
 
-        # Process each layer hierarchically
+            r_index = self.WM_gates[i](s, r_prev.squeeze(0), i)  # Get next WM index
+            self.WM[i] = r_index # Update WM with index
+
+            r = F.one_hot(r_index.long().unsqueeze(0), num_classes=self.n_stimuli).float()  # One-hot encode for layer input
+            rs.append(r.squeeze(0))
+
+            wm_mask = r.clone() # WM mask is now the one-hot r
+
+            if modulation is not None:
+                p = self.layers[i](r.squeeze(0), wm_mask.squeeze(0), modulation)
+            else:
+                p = self.layers[i](r.squeeze(0), wm_mask.squeeze(0))
+
+            ps.append(p)
+
+            if i > 0:
+                modulation = p  # No need to flatten, keep as vector
+
+        return ps[0]  # Return prediction (logits)
+
+    def backward(self, s, a_index, outcome, rs, ps):
+        """
+        Backpropagation through the HER model.
+
+        Args:
+            s: Input stimulus vector.
+            a_index: Index of the selected action.
+            o: Outcome vector.
+            rs: List of working memory representations (r) for each layer.
+            ps: List of predictions (p) for each layer.
+        """
+
+        es = [] # Store error signals for each layer
+        # Initialize outcome for lowest layer
+        # One-hot encode the outcome
+        o_prime = torch.tensor(outcome, dtype=torch.float32) # Outcome is now a tensor
+
         for i in range(self.n_layers):
-            r_prev = self.WM[i]  # Get current WM content
-            r, prob_store = self.WM_gates[i](s, r_prev, self.eligibility_traces[i])
-            rs.append(r)
-            self.WM[i] = r  # Update working memory
-            # Update eligibility trace (Eq. 2.6) Xt+1 = Xt + (etT Wt · rt )dtT. The dot means element-wise multiplication
-            self.eligibility_traces[i] = self.lambdas[i] * self.eligibility_traces[i] + s  # Decay and add current stimulus
-            # Top-down modulation (Eq. 2.9, 2.10)
-            modulation_from_above = None
+            # Calculate modulated prediction (m)
+            modulation = None
             if i < self.n_layers - 1:
-                p_higher = self.layers[i+1](self.WM[i+1])
-                modulation_from_above = p_higher.reshape(self.n_representations, self.n_outcomes)  # Reshape for additive modulation
-                modulations.append(modulation_from_above)
+                modulation = ps[i+1].flatten()
+            m = self.layers[i](rs[i], modulation)
 
-            p = self.layers[i](r)  # Predictions *before* modulation
-            # Apply top-down modulation to predictions
-            if modulation_from_above is not None:
-                p = p + torch.flatten(modulation_from_above) # Apply modulation to predictions
+            wm_mask = F.one_hot(self.WM[i].long(), num_classes=self.n_representations).float()
+            m = self.layers[i](rs[i], wm_mask, modulation) # Pass wm_mask for modulation
 
-            if i == 0: # Lowest layer uses actual outcome (Eq. 2.2)
-                # Filter error based on selected action. Create a one-hot vector for the action:
-                a = torch.zeros(n_actions)
-                a[a_index] = 1.0
-                e = a * (o - p)  # (Eq. 2.2)
-                o_prime = torch.outer(r, e.T)  # (Eq. 2.7) O' = reT
 
-            else: # Higher layers use error from below as outcome (Eq. 2.8, 2.11)
-                o_higher = torch.flatten(o_prime) # Flatten o_prime from previous layer
-                a_higher = torch.zeros_like(p) # Placeholder for action vector at higher levels (needs to be defined based on task)
-                e = a_higher * (o_higher - p) # Error at higher layers # (Eq. 2.8, 2.11) e' = a'(o' − p' ).
-                if i < self.n_layers - 1: # Only calculate o_prime if not the top layer
-                    o_prime = torch.outer(r, e.T)
+            # Filter errors (Eq. 2.2)
+            filter_ = torch.zeros_like(o_prime)
+            filter_[a_index] = 1
+            e = filter_ * (o_prime - m) # Error calculation (Eq. 2.11)
+            es.append(e) # Store error
 
-            errors.append(e)
-            self.layers[i].update_weights(e, r) # Update layer weights (Eq. 2.3)
-            # Update gating weights AFTER error calculation
-            self.WM_gates[i].X.data += self.WM_gates[i].alpha * torch.outer(torch.matmul(e, self.layers[i].W.T), self.eligibility_traces[i]) # (Eq. 2.6)
+            # Update layer weights
+            self.layers[i].update_weights(e, rs[i])
 
-        # Response Selection (using separate predictions for correct/error)
-        p_lowest = self.layers[0](rs[0])
-        if len(modulations) > 0:
-            p_lowest = p_lowest + torch.flatten(modulations[0])
+            # Update WM gating weights (Eq. 2.6)
+            error_backpropagated = torch.matmul(e, self.layers[i].W.T) # Backpropagate error
+            self.WM_gates[i].update_weights(error_backpropagated, self.eligibility_traces[i])
 
-        response_logits = torch.matmul(p_lowest, self.W_response)  # Get logits for each response
-        response_probabilities = F.softmax(self.gamma * response_logits, dim=0)  # Softmax over responses (Eq. 2.13)
 
-        return response_probabilities, errors, rs
+            if i < self.n_layers - 1: # Calculate outcome for next higher layer (Eq. 2.7)
+                o_prime = torch.outer(rs[i], e) # Outer product
+                o_prime = o_prime.flatten() # Flatten for next layer
+
+        # Recalculate response_probs within backward (or pass it from forward)
+        response_logits = torch.matmul(ps[-1], self.W_response) # Use ps[-1] from the arguments
+        response_probs = F.softmax(response_logits * self.gamma, dim=-1)
+
+        # Update response selection weights (using error from lowest layer)
+        self.response_optimizer.zero_grad()
+        response_loss = -torch.log(response_probs[a_index])  # Negative log-likelihood loss
+        response_loss.backward() # retain_graph to avoid issues with multiple backward passes
+        self.response_optimizer.step()

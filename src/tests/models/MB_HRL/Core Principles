@@ -1,0 +1,108 @@
+Core Principles:
+
+    Hierarchical Decomposition: Complex tasks are decomposed into a hierarchy of simpler sub-tasks, represented by options.
+
+    Temporal Abstraction: Options represent temporally extended actions, allowing the agent to reason and plan at multiple timescales.
+
+    Meta-Learning: The agent learns how to learn quickly on new tasks drawn from a distribution by sharing knowledge (primitives/options) across tasks and rapidly adapting task-specific parameters.
+
+    Option Discovery: Useful options are discovered and formed automatically through experience, rather than being pre-defined.
+
+    Intra-Option Learning with Full Option-Critic Updates: The agent updates all relevant options from each experience, not just the currently executing one. The updates use the full option-critic framework, including policy gradients for both intra-option policies and termination functions.
+
+    Attention Mechanism: The agent learns an attention mechanism for each option, enabling it to focus on relevant parts of the observation space. This attention mechanism is crucial for option specialization and diversity.
+
+    Gating Mechanisms: The model uses gating mechanisms within the GRUs to control the option, and termination state context to the habitual net bias its behavior to preform the option toward the goal.
+
+    Error-Driven Control: The agent adjusts its internal processing based on prediction errors, reflecting a form of cognitive control. This is used to modulate the contrast of value representations in working memory.
+
+    Biologically Inspired: The model draws inspiration from neuroscience findings on the prefrontal cortex (PFC), anterior cingulate cortex (ACC), and basal ganglia, particularly regarding hierarchical control, option representation, and error monitoring.
+
+Model Structure:
+
+    Hierarchical GRU Chain: The core of the model is a chain of Gated Recurrent Units (GRUs), where each GRU (or set of GRUs) represents a layer in the hierarchy.
+
+        Lowest Layer: Interfaces directly with the environment, receiving observations and outputting primitive actions.
+
+        Higher Layers: Represent increasingly abstract levels of control, with the highest layer representing the master policy.
+
+    Information Flow:
+
+        Top-Down Context: Higher-level GRUs provide context to lower-level GRUs, biasing them towards executing actions consistent with the current goal and option. This context is passed as the hidden state from a higher-level GRU to a lower-level GRU.
+
+        Environment Input: Each GRU layer also receives input directly from the environment. It should resemble the same format as the output of the model to allow for rollouts of imagined states, where outputs are fed back into the model, thus allowing for the creation of plans. Goal/termination states can be represented as distances to the objects, and coordinates in the environment. inputs/outputs should be between 0 <= x <= 1 with 1 being on top of object.
+
+    Option Representation:
+
+        Shared Parameters (φ): The weights and biases of the GRU units are shared across all tasks. These parameters encode the learned primitives or options.
+
+        Option Selection: The master policy (highest-level GRU) outputs a probability distribution over the available options (πΩ(ω|s)). This is achieved by a dedicated output head on the master policy's GRU.
+
+        Option Execution: Once an option is selected, the corresponding lower-level GRU takes control and generates a sequence of actions until the option terminates, according to its termination function
+
+    Task-Specific Parameters (θ):
+
+        Context: The primary way in which the agent adapts to a new task is by adjusting the option and termination-state context provided to the GRUs. This context can take the form of:
+
+            Initial Hidden States: The initial hidden states of the higher-level GRUs can be set based on the task.
+
+            Modulatory Inputs: Task-specific information can be provided as external inputs to the GRU units at each timestep.
+
+        Policy over Options: The parameters of the policy over options (πΩ) are learned and adapted for each task.
+
+        Value Function: The parameters of the value function are adapted for each task.
+
+    Value Function:
+
+        Option-Value Function: The model learns an option-value function QΩ(s, ω) that estimates the value of executing option ω in state s.
+
+        Advantage Function: The advantage function AΩ(s, ω) = QΩ(s, ω) - VΩ(s) is explicitly calculated and used for updating the policy over options and the termination functions.
+
+    Termination:
+
+        Learned Termination: Each GRU layer (except the lowest) has a termination head (βω) that outputs a probability distribution over the available options, representing the probability of terminating the current option for each option.
+
+        Termination Function: The termination probability is a learned function of the GRU's hidden state and the chosen option.
+
+    Attention:
+
+        Learnable Attention: The model learns an attention mechanism for each option.
+
+        State-Dependent: The attention mechanism is a function of the input observation (or features extracted from it).
+
+        Application: Attention is applied to the input observation by multiplying the observation with the attention weights. The result is then fed into the GRU units.
+
+    Gating:
+
+        Internal Gates: GRUs have internal gating mechanisms (update and reset gates) that control the flow of information within the unit.
+
+Learning Algorithm:
+
+    Option-Critic Updates:
+
+        The policy over options (πΩ) is trained using a policy gradient algorithm, with gradients based on the advantage function AΩ(s, ω).
+
+        The intra-option policies (πω,θ) are trained using a policy gradient algorithm, with gradients based on the Q-function QU (s, ω, a).
+
+        The termination functions (βω,ϑ) are trained using the termination gradient theorem (Theorem 2 in the paper), which relates the gradient of the option model to the gradient of the termination function.
+
+    Intra-Option Learning:
+
+        All relevant options are updated from each experience, not just the currently executing one.
+
+        Importance sampling is used to correct for the fact that the updates are based on off-policy data (if necessary, depending on the specific update rules).
+
+    Error-Driven Control:
+
+        The control gains (which affect the contrast of value representations) are adjusted based on the frequency of errors or the magnitude of reward prediction errors.
+
+        Higher error rates lead to increased control gain, resulting in more focused and deliberate decision-making.
+
+    Meta-Learning:
+
+        The shared parameters (φ) are updated to enable fast learning on new tasks.
+
+        The task-specific parameters (θ) are adapted quickly to each new task.
+
+        The master policy is reset between tasks to facilitate meta-learning.
+

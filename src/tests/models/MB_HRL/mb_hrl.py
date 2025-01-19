@@ -3,267 +3,531 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from collections import defaultdict
-
-# GRU uses information hiding to bias the habitual network toward the goal.
-# Control is governed by the amount of error.
+import random
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import numpy as np
+import copy
+torch.autograd.set_detect_anomaly(True)
 
 # Constants (Hyperparameters)
 GAMMA = 0.99  # Discount factor
 N_OPTIONS = 4  # Number of options
-N_GOALS = 8 # Number of goals
-N_LAYERS = 2 # Number of layers in the hierarchy
+N_LAYERS = 2  # Number of layers in the hierarchy
 CONTROL_LR = 0.01
 HABITUAL_LR = 0.001
 ERROR_ALPHA = 0.1
 N_MAX_LAYER_ITERATIONS = 10
+ATTENTION_DIVERSITY_WEIGHT = 1.0  # Weight for attention diversity loss
+ATTENTION_SPARSITY_WEIGHT = 0.1  # Weight for attention sparsity loss
+DELIBERATION_COST = 0.01  # Cost for switching options
+
+class AttentionMechanism(nn.Module):
+    def __init__(self, input_size, n_options):
+        super(AttentionMechanism, self).__init__()
+        self.attention_weights = nn.Linear(input_size, n_options)
+
+    def forward(self, x):
+        attn_weights = F.softmax(self.attention_weights(x), dim=-1)
+        return attn_weights
 
 class HierarchicalGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, n_options, n_goals, n_layers,
-                 control_lr=0.01, habitual_lr=0.001, error_alpha=0.1, error_window=10, n_max_layer_iterations=10):
+    def __init__(self, input_size, hidden_size, n_options, n_layers,
+                 control_lr=0.01, habitual_lr=0.001, error_alpha=0.1, n_max_layer_iterations=10):
         super(HierarchicalGRU, self).__init__()
         self.input_size = input_size
         self.n_options = n_options
         self.hidden_size = hidden_size
-        self.option_efforts = torch.zeros(n_options)
-        self.n_goals = n_goals
         self.n_layers = n_layers
         self.error_alpha = error_alpha
-        self.average_error = defaultdict(float)  # Initialize average error for each layer
-        self.control_gains = defaultdict(lambda: 0.5)  # Initialize control gains to 0.5 (or a value <1)
+        self.average_error = defaultdict(float)
+        self.control_gains = defaultdict(lambda: 0.5)
         self.n_max_layer_iterations = n_max_layer_iterations
+        self.current_option = None
 
-        # GRU cells for each layer
-        # Input to each GRU layer: environment observation + hidden state from the layer above
-        self.grus = nn.ModuleList([
-            nn.GRUCell(
-                input_size + (hidden_size if i < n_layers - 1 else 0),  # Include context from the higher layer
-                hidden_size
-            ) for i in range(n_layers)
-        ])
+        self.attention = AttentionMechanism(input_size, n_options)
 
-        # Predicted efforts for individual options/actions
-        self.effort_heads = nn.ModuleList([
+        # Use GRU instead of GRUCell
+        self.grus = nn.ModuleList()
+        self.grus.append(nn.GRU(input_size, hidden_size, batch_first=True))
+        for i in range(1, n_layers):
+            self.grus.append(nn.GRU(input_size + hidden_size, hidden_size, batch_first=True))
+
+        self.value_heads = nn.ModuleList([
             nn.Linear(hidden_size, n_options) for _ in range(n_layers)
         ])
 
-        # Predicted value for having taken a specific action in a given state
-        self.value_heads = nn.ModuleList([
-            nn.Linear(hidden_size, 1) for _ in range(n_layers)
-        ])
-        
-        # Goal prediction heads for each layer
-        self.goal_heads = nn.ModuleList([
-            nn.Linear(hidden_size, n_goals) for _ in range(n_layers)
-        ])
-
-        # Termination functions for each layer (except the lowest)
         self.termination_heads = nn.ModuleList([
-            nn.Linear(hidden_size, 1) for _ in range(n_layers - 1)
+            nn.Linear(hidden_size, n_options) for _ in range(n_layers - 1)
         ])
 
-        # Optimizers
         self.control_optimizer = optim.Adam(
-            list(self.effort_heads.parameters()) +
             list(self.value_heads.parameters()) +
-            list(self.goal_heads.parameters()) +
-            list(self.termination_heads.parameters()),  # termination heads are part of control
+            list(self.termination_heads.parameters()) +
+            list(self.attention.parameters()),
             lr=control_lr
         )
         self.habitual_optimizer = optim.Adam(self.grus.parameters(), lr=habitual_lr)
 
-
-    # Apply contrast using softmax temperature
     def apply_gain_contrast(self, tensor, gain):
-        # gain determines the strength of contrast
-        # centered around 0.5, the midpoint of the sigmoid.
-        # gain = 0 means no contrast, gain = 1 means maximum contrast
-        # gain is learned, and stored in self.control_gains
-        
-        # center around 0.5
         centered_tensor = tensor - 0.5
-        # scale by gain
         scaled_tensor = centered_tensor * gain
-        # return to original range
         contrasted = scaled_tensor + 0.5
-        
         return contrasted
 
-    def get_cost(self, efforts, values):
-        """Calculate cost ratio. Add a small epsilon to avoid division by zero."""
-        # Cost is effort divided by value. The higher the value, the lower the cost.
-        # The higher the effort, the higher the cost.
-        # Adding a small epsilon ensures numerical stability.
-        return efforts / (values + 1e-6)
+    def select_option(self, option_probabilities, chosen_option):
+        dist = torch.distributions.Categorical(logits=option_probabilities)
+        new_option_index = dist.sample()
+        print(f"Chosen option: {chosen_option}")
+        print(f"Option probabilities: {option_probabilities}")
+        print(f"New option index: {new_option_index}")
 
-    def select_option(self, efforts, values):
-        """Select option based on lowest cost."""
-        costs = self.get_cost(efforts, values)
-        # this returns the index of the option with the lowest cost
-        return torch.argmin(costs, dim=-1).item()
+        # Apply clamping only if current_option is not None
+        if self.current_option is not None and new_option_index == self.current_option:
+            # Clamp the sampled option index to ensure it's within the valid range
+            new_option_index = torch.clamp(new_option_index, 0, self.n_options - 1)
+
+        if self.current_option is not None and new_option_index != self.current_option:
+            deliberation_cost = DELIBERATION_COST
+        else:
+            deliberation_cost = 0
+        self.current_option = new_option_index.item()  # Convert to a scalar (Python number)
+
+        # Update chosen_option tensor (ensure it's a tensor and a scalar)
+        if not isinstance(chosen_option, torch.Tensor):
+            chosen_option = torch.tensor(self.current_option, dtype=torch.long, device=option_probabilities.device)
+        else:
+            chosen_option.fill_(self.current_option)  # Fill with the scalar value
+
+        return self.current_option, deliberation_cost
 
     def update_control_gain(self, layer_idx, reward, value):
-        """Update control gain based on reward prediction error."""
-        # Calculate the prediction error (RPE)
-        prediction_error = reward - value.item()  # .item() to get a scalar value
+        with torch.no_grad():
+            prediction_error = reward - value.item()
+            self.average_error[layer_idx] = (1 - self.error_alpha) * self.average_error[layer_idx] + self.error_alpha * prediction_error
+            self.control_gains[layer_idx] = max(0, 1.0 - abs(self.average_error[layer_idx]))
 
-        # Update running average of error using exponential moving average
-        self.average_error[layer_idx] = (1 - self.error_alpha) * self.average_error[layer_idx] + self.error_alpha * prediction_error
+    def terminate_option(self, termination_prob):
+        return termination_prob > random.random()
 
-        # Update gain based on average error
-        # Example: Increase gain if error is large (positive or negative), decrease if error is small
-        # The specific function can be adjusted
-        self.control_gains[layer_idx] = max(0, 1.0 - abs(self.average_error[layer_idx]))
+    def forward_layer(self, layer_idx, x, hidden_state, chosen_option, obs):
+        print(f"  forward_layer - layer_idx: {layer_idx}")
+        print(f"  forward_layer - x shape: {x.shape}")
+        print(f"  forward_layer - hidden_state shape: {hidden_state.shape}")
+        print(f"  forward_layer - chosen_option: {chosen_option}")
+        print(f"  forward_layer - obs shape: {obs.shape}")
+        # Ensure chosen_option is a tensor with proper device
+        if not isinstance(chosen_option, torch.Tensor):
+            chosen_option = torch.tensor(chosen_option, dtype=torch.long, device=x.device)
+        elif chosen_option.device != x.device:
+            chosen_option = chosen_option.to(x.device)
 
-    def terminate_option(self, layer_idx, hidden_state):
-        """Decide whether to terminate the current option based on the termination head output."""
-        termination_prob = torch.sigmoid(self.termination_heads[layer_idx](hidden_state))
-        # returns true if termination probability is greater than 0.5, else false
-        return termination_prob.item() > 0.5
+        # Apply attention to the input observation (obs)
+        attn_weights = self.attention(obs)
+        print(f"  forward_layer - attn_weights shape: {attn_weights.shape}")
 
-    def forward_layer(self, layer_idx, x, hidden_state, context=None):
-        """
-        Perform a forward pass for a single layer.
-        Returns output and updated hidden state.
-        """
-        # Concatenate input with context from the higher layer
-        if context is not None:
-            # context is the hidden state of the layer above
-            input_with_context = torch.cat((x, context), dim=-1)
+        # Ensure chosen_option has the correct shape for gathering
+        chosen_option_expanded = chosen_option.view(x.size(0), 1).expand(x.size(0), self.n_options)
+        print(f"  forward_layer - chosen_option_expanded shape: {chosen_option_expanded.shape}")
+
+        # Gather attention weights for the chosen option along dimension 1
+        attn_weights_for_option = attn_weights.gather(1, chosen_option_expanded)
+        print(f"  forward_layer - attn_weights_for_option shape: {attn_weights_for_option.shape}")
+
+        # Reshape for broadcasting and apply attention
+        x_weighted = obs * attn_weights_for_option.unsqueeze(-1) # Apply attention to obs
+        print(f"  forward_layer - x_weighted shape: {x_weighted.shape}")
+
+        # Get input for the current layer
+        if layer_idx == 0:
+            input_tensor = x_weighted  # Input for the first layer is the observation
         else:
-            input_with_context = x
-        
+            # Squeeze x_weighted and hidden_state before concatenation
+            print(f"  forward_layer - x_weighted.squeeze(1) shape: {x_weighted.squeeze(1).shape}")
+            print(f"  forward_layer - hidden_state.squeeze(0) shape: {hidden_state.squeeze(0).shape}")
+            input_tensor = torch.cat((x_weighted.squeeze(1), hidden_state.squeeze(0)), dim=-1)
+        print(f"  forward_layer - input_tensor shape: {input_tensor.shape}")
 
-        hidden_state = self.grus[layer_idx](input_with_context, hidden_state)
+        # Use GRU, which handles sequences
+        output, hidden_state = self.grus[layer_idx](input_tensor, hidden_state)
+        print(f"  forward_layer - output shape: {output.shape}")
+        print(f"  forward_layer - hidden_state shape: {hidden_state.shape}")
 
-        # Apply gain contrast to hidden state
+        # Apply gain contrast to the hidden state
         hidden_state = self.apply_gain_contrast(hidden_state, self.control_gains[layer_idx])
+        print(f"  forward_layer - hidden_state after gain contrast shape: {hidden_state.shape}")
 
-        goals = self.goal_heads[layer_idx](hidden_state)
-        efforts = self.effort_heads[layer_idx](hidden_state)
-        values = self.value_heads[layer_idx](hidden_state)
-    
-        # Option Selection (for the master policy)
-        if layer_idx == 0: # Master policy is at the lowest level
-            chosen_option_index = self.select_option(efforts, values)
-            # One-hot encode the chosen option
-            chosen_option = F.one_hot(chosen_option_index, num_classes=self.n_options).float()
-            # Concatenate the chosen option with the observation for the next layer
-            x = torch.cat((x, chosen_option), dim=-1)  # Pass chosen option as input to next layer
-            if layer_idx < self.n_layers - 1:
-                return (goals, efforts, values, termination, chosen_option), hidden_state
-            else:
-                return (goals, efforts, values, chosen_option), hidden_state
+        # Get value, effort, and termination outputs
+        values = self.value_heads[layer_idx](hidden_state.squeeze(0)) # Use hidden_state for value heads
+        print(f"  forward_layer - values shape: {values.shape}")
+
+        if layer_idx < self.n_layers - 1:
+            termination_prob = torch.sigmoid(self.termination_heads[layer_idx](hidden_state.squeeze(0))).gather(1, chosen_option.unsqueeze(1)) # Use hidden state for termination
+            print(f"  forward_layer - termination_prob shape: {termination_prob.shape}")
         else:
-            if layer_idx < self.n_layers - 1:
-                return (goals, efforts, values, termination), hidden_state
-            else:
-                return (goals, efforts, values), hidden_state
+            termination_prob = None
 
-    def process_event(self, layer_idx, x, hidden_states, chosen_option, reward=None, timestep=0):
-        """Process a single timestep within an option."""
-        # Get initial output for this layer
-        # Pass the hidden state of the layer above as context to the current layer
-        output, hidden_states[layer_idx] = self.forward_layer(
-            layer_idx,
-            x,
-            hidden_states[layer_idx],
-            hidden_states[layer_idx + 1] if layer_idx < self.n_layers - 1 else None
+        return values, termination_prob, hidden_state, output
+
+    def process_event(self, layer_idx, x, hidden_states, chosen_option, obs, reward=None, effort=None, timestep=0, accumulated_deliberation_cost=0):
+        print(f"process_event - layer_idx: {layer_idx}")
+        print(f"process_event - x shape: {x.shape}")
+        print(f"process_event - hidden_states shapes: {[h.shape for h in hidden_states]}")
+        print(f"process_event - chosen_option: {chosen_option}")
+        print(f"process_event - obs shape: {obs.shape}")
+        # Ensure chosen_option is a tensor
+        if not isinstance(chosen_option, torch.Tensor):
+            chosen_option = torch.tensor(chosen_option, dtype=torch.long, device=x.device)
+        elif chosen_option.device != x.device:
+            chosen_option = chosen_option.to(x.device)
+
+        # Forward pass for the current layer
+        values, termination_output, hidden_states[layer_idx], output = self.forward_layer(
+            layer_idx, x, hidden_states[layer_idx], chosen_option, obs
         )
 
-        goals = output[0]
-        efforts = output[1]
-        values = output[2]
-
-        # Select option based on efforts and values
-        chosen_option_index = self.select_option(efforts, values)
-
-        # If not at the lowest layer, recursively process lower layer events
+        # Option selection logic for higher layers (before recursion)
         if layer_idx < self.n_layers - 1:
-            # Execute the chosen option for a fixed number of steps or until termination
-            termination = False
-            for _ in range(self.n_max_layer_iterations):  # Or until termination condition is met
+            if self.terminate_option(termination_output):
+                print(f"Option terminated for layer: {layer_idx}")
+                option_probabilities = values  # Use value as a proxy for option selection
+                new_chosen_option, deliberation_cost = self.select_option(option_probabilities, chosen_option)
+                chosen_option.fill_(new_chosen_option)  # Ensure valid option is chosen
+                print(f"New Chosen option: {new_chosen_option}")
+                accumulated_deliberation_cost += deliberation_cost
 
-                # Process lower layer event, passing chosen_option as context
-                lower_layer_output, hidden_states = self.process_event(
-                    layer_idx + 1, x, hidden_states, chosen_option, reward, timestep)
+                # Update hidden state for the new option
+                new_hidden_states = []
+                for i in range(self.n_layers):
+                    if i == layer_idx:
+                        new_hidden_states.append(self.init_hidden(x.size(0))[i])
+                    else:
+                        new_hidden_states.append(hidden_states[i])
+                hidden_states = new_hidden_states
 
-                # Update this layer's state based on lower layer output
-                # Concatenate lower layer output with current input
-                # Use value as a proxy for lower layer output
-                x_combined = torch.cat((x, lower_layer_output[2]), dim=-1)
-                output, hidden_states[layer_idx] = self.forward_layer(
-                    layer_idx,
-                    x_combined,
-                    hidden_states[layer_idx],
-                    hidden_states[layer_idx + 1] if layer_idx < self.n_layers - 1 else None
-                )
+        # Recursive call for lower layers
+        if layer_idx < self.n_layers - 1:
+            _, lower_values, hidden_states = self.process_event(
+                layer_idx + 1, x, hidden_states, chosen_option, obs, reward, effort, timestep, accumulated_deliberation_cost
+            )
+            timestep += 1
 
-                # Update control gain based on reward prediction error for this layer
-                if reward is not None:
-                    self.update_control_gain(layer_idx, reward, output[2])
+        # Update control gain based on reward prediction error (both layers)
+        if reward is not None:
+            self.update_control_gain(layer_idx, reward, values.gather(1, chosen_option.unsqueeze(1)))
 
-                # Update goals, efforts, and values with the new output
-                goals = output[0]
-                efforts = output[1]
-                values = output[2]
+        # Ensure chosen_option is always valid
+        chosen_option = torch.clamp(chosen_option, 0, self.n_options - 1)
 
-                if self.terminate_option(layer_idx, hidden_states[layer_idx]):
-                    termination = True
-                    break  # Terminate the option
-
-                timestep += 1 # Increment timestep within the option
-            
-            if termination:
-                # If the option terminated, choose a new option for the next step
-                chosen_option_index = self.select_option(efforts, values)
-                chosen_option = F.one_hot(chosen_option_index, num_classes=self.n_options).float()
-        else:
-            # Update control gain based on reward prediction error for the lowest layer
-            if reward is not None:
-                self.update_control_gain(layer_idx, reward, values)
-
-        return output, hidden_states
+        print(f"process_event - returning - output shape: {output.shape}")
+        print(f"process_event - returning - values shape: {values.shape}")
+        print(f"process_event - returning - hidden_states shapes: {[h.shape for h in hidden_states]}")
+        return output, values, hidden_states
 
     def init_hidden(self, batch_size):
-        """Initialize hidden states for all layers."""
-        return [torch.zeros(batch_size, self.hidden_size) for _ in range(self.n_layers)]
+        # Adjust the initialization for GRU, which has a different hidden state shape
+        return [torch.zeros(1, batch_size, self.hidden_size, device=self.grus[0].weight_hh_l0.device) for _ in range(self.n_layers)]
 
-    def update_layer_weights(self, layer_idx, target_value):
-        """Update weights for a specific layer using accumulated values as targets."""
+    def update_layer_weights(self, layer_idx, obs, chosen_option, reward, effort, next_obs, done, hidden_state):
+        print("-" * 30)
+        print(f"Updating layer: {layer_idx}")
         # habitual network update
         self.habitual_optimizer.zero_grad()
 
-        # Get current predictions
-        output, hidden_state = self.forward_layer(
-            layer_idx,
-            torch.zeros_like(target_value),  # placeholder input
-            self.grus[layer_idx].weight_ih_l0.new_zeros(self.hidden_size), # use weights from layer to initialize hidden state
-            None if layer_idx == 0 else target_value # use target value for previous layer output
-        )
+        # Clone hidden_state to avoid in-place modifications
+        hidden_state_clone = hidden_state.clone()
+        print(f"update_layer_weights - hidden_state_clone shape: {hidden_state_clone.shape}")
 
-        # Compute loss for value function
-        value_loss = F.mse_loss(output[2], target_value)
+        # Forward pass for the current layer
+        values, termination_output, _, output = self.forward_layer(layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs)
+        print(f"  values shape: {values.shape}")
+        print(f"  termination_output shape: {termination_output.shape if termination_output is not None else None}")
+        print(f"  output shape: {output.shape}")
+
+        # Get the target option from the model's output
+        target_option = values.argmax(dim=-1)
+        print(f"  target_option: {target_option}")
+
+        # Compute loss for value function using TD error
+        with torch.no_grad():
+            next_values, _, _, next_output = self.forward_layer(
+                layer_idx,
+                next_obs.unsqueeze(1),
+                hidden_state.detach().clone(),
+                target_option,
+                next_obs
+            )
+            print(f"  next_values shape: {next_values.shape}")
+            print(f"  next_output shape: {next_output.shape}")
+
+            # Compute target Q-value with proper handling of termination
+            if done:
+                target_q = reward.clone()
+            else:
+                # Ensure target_option is within valid range [0, num_options - 1]
+                target_option = torch.clamp(target_option, 0, self.n_options - 1)
+
+                next_q = next_values.max(dim=1, keepdim=True)[0]
+                print(f"  next_q shape: {next_q.shape}")
+
+                # Incorporate effort into the target value calculation
+                if layer_idx == 0:
+                    # Higher layer: consider deliberation cost
+                    current_return = reward - DELIBERATION_COST
+                    continue_value = (1 - termination_output) * next_values.gather(1, chosen_option)
+                    switch_value = next_values.max(dim=1, keepdim=True)[0] - DELIBERATION_COST
+                    target_q = current_return + GAMMA * torch.max(continue_value, switch_value)
+
+                else:
+                    # Lower layer: use immediate reward minus effort
+                    target_q = reward - effort + GAMMA * next_q # Effort is used here
+
+        print(f"  target_q shape: {target_q.shape}")
+        print(f"  chosen_option: {chosen_option}")
+        # Ensure chosen_option has the correct shape for gathering
+        chosen_option = chosen_option.view(-1, 1)
+        q_values = values.gather(1, chosen_option).squeeze(1)
+        print(f"  q_values shape: {q_values.shape}")
+        value_loss = F.mse_loss(q_values, target_q.squeeze(1))
+        print(f"  value_loss: {value_loss}")
 
         # Update weights for value function
         value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.habitual_optimizer.step()
 
         if layer_idx < self.n_layers - 1:
             # control network update
             self.control_optimizer.zero_grad()
-            # Compute loss for goal prediction
-            goal_loss = F.mse_loss(output[0], target_value) # Assuming target_value can also represent target goals
 
-            # Update weights for goal prediction
-            goal_loss.backward()
+            # Compute advantage
+            print(f"  values shape: {values.shape}")
+            print(f"  chosen_option shape: {chosen_option.shape}")
+            advantage = values.gather(1, chosen_option) - values.max(1, keepdim=True)[0]
+            print(f"  advantage shape: {advantage.shape}")
+
+            # Compute loss for policy over options
+            policy_loss = -torch.log(F.softmax(values, dim=-1).gather(1, chosen_option)).mean()
+            print(f"  policy_loss: {policy_loss}")
+
+            # Compute loss for termination function
+            print(f"  termination_prob shape: {termination_output.shape if termination_output is not None else None}")
+            termination_loss = -torch.log(1 - termination_output.clamp(min=1e-8)).mean() if advantage.mean() < 0 else torch.tensor(0.0, requires_grad=True, device=values.device)
+            print(f"  termination_loss: {termination_loss}")
+
+            # Compute loss for attention diversity
+            attn_weights = self.attention(obs)
+            attention_diversity_loss = 0
+            for i in range(self.n_options):
+                for j in range(i + 1, self.n_options):
+                    attention_diversity_loss += F.cosine_similarity(attn_weights[:, i], attn_weights[:, j], dim=0)
+            print(f"  attention_diversity_loss: {attention_diversity_loss}")
+
+            # Compute loss for attention sparsity
+            attention_sparsity_loss = torch.norm(attn_weights, p=1, dim=-1).mean()
+            print(f"  attention_sparsity_loss: {attention_sparsity_loss}")
+
+            # Combine losses
+            total_control_loss = (
+                policy_loss
+                + termination_loss
+                + ATTENTION_DIVERSITY_WEIGHT * attention_diversity_loss
+                + ATTENTION_SPARSITY_WEIGHT * attention_sparsity_loss
+            )
+            print(f"  total_control_loss: {total_control_loss}")
+
+            # Update weights for control network
+            total_control_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             self.control_optimizer.step()
+        print("-" * 30)
 
-
-    def forward(self, x, hidden_states=None):
-        # Initialize hidden states if not provided
+    def forward(self, x, chosen_option, hidden_states=None):
+        obs = x
         if hidden_states is None:
-            hidden_states = [torch.zeros(1, self.hidden_size) for _ in range(self.n_layers)]
+            hidden_states = self.init_hidden(x.size(0))
 
         # Process the event through the hierarchy
-        final_output, _ = self.process_event(0, x, hidden_states)
-        return final_output
+        final_output, values, _ = self.process_event(0, x.unsqueeze(1), hidden_states, chosen_option, obs)
+
+        # Return both final_output and values from the lowest layer
+        return final_output, values
+
+# Test parameters
+N_EPISODES = 100
+MAX_STEPS = 50
+EPSILON = 0.3
+TEST_EVERY_N_EPISODES = 10
+
+# Define a simple grid world environment
+class GridWorld:
+    def __init__(self, size=5):
+        self.size = size
+        self.state = (0, 0)  # Start at bottom left
+        self.goal = (size - 1, size - 1)  # Goal at top right
+
+    def reset(self):
+        self.state = (0, 0)
+        return self.state
+
+    def step(self, action):
+        x, y = self.state
+        if action == 0:  # Up
+            next_state = (x, min(y + 1, self.size - 1))
+        elif action == 1:  # Down
+            next_state = (x, max(y - 1, 0))
+        elif action == 2:  # Left
+            next_state = (max(x - 1, 0), y)
+        elif action == 3:  # Right
+            next_state = (min(x + 1, self.size - 1), y)
+        else:
+            next_state = self.state  # Invalid action
+
+        self.state = next_state
+        reward = 1 if next_state == self.goal else 0
+        done = next_state == self.goal
+        effort = 0.1 if action < 4 else 0  # Assume some effort for movement actions
+        return next_state, reward, done, effort
+
+    def get_observation(self):
+        # One-hot encoding of the state
+        obs = torch.zeros(1, self.size * self.size)
+        obs[0, self.state[0] * self.size + self.state[1]] = 1
+        return obs
+
+# Initialize environment and agent
+env = GridWorld()
+INPUT_SIZE = env.size * env.size  # One-hot encoding of states
+HIDDEN_SIZE = 64
+model = HierarchicalGRU(INPUT_SIZE, HIDDEN_SIZE, N_OPTIONS, N_LAYERS)
+
+# Function to run an episode and collect data for training
+def run_episode(model, env, epsilon=0.3):
+    obs = env.reset()
+    obs = env.get_observation()
+    done = False
+    hidden_states = model.init_hidden(1)
+    episode_data = []
+    total_reward = 0
+    total_effort = 0
+    steps = 0
+    accumulated_deliberation_cost = 0
+
+    chosen_option = torch.tensor([random.randint(0, N_OPTIONS - 1)], dtype=torch.long, device=obs.device)
+
+    while not done and steps < MAX_STEPS:
+        # Get model output for the current layer
+        output, values = model.forward(obs, chosen_option, hidden_states)
+
+        # Select action based on the chosen option's policy
+        if random.random() < epsilon:
+            action = torch.tensor([random.randint(0, 3)], device=obs.device)
+        else:
+            action = output[0].argmax(dim=-1).unsqueeze(-1)
+
+        # Take the chosen action in the environment
+        next_obs, reward, done, effort = env.step(action.item())
+        next_obs = env.get_observation()
+
+        # Get the target option from the model's output (use values from the lowest layer)
+        print(f"Values: {values}")
+        target_option = values.argmax(dim=-1)
+        print(f"Target option: {target_option}")
+
+        # Apply accumulated deliberation cost
+        reward = reward - accumulated_deliberation_cost
+        accumulated_deliberation_cost = 0  # Reset for the next step
+
+        # Store data for training (including target_option)
+        episode_data.append(
+            (obs, chosen_option.clone(), reward, effort, next_obs, done, target_option, hidden_states[0].clone())
+        )
+
+        # Update current state, chosen option, and hidden states
+        obs = next_obs
+        chosen_option = target_option.clone()
+        hidden_states = [h.detach().clone() for h in hidden_states]
+
+        total_reward += reward
+        total_effort += effort
+        steps += 1
+
+    return episode_data, total_reward, total_effort
+
+# Function to perform model updates
+def update_model(model, episode_data):
+    for layer_idx in reversed(range(model.n_layers)):
+        for obs, chosen_option, reward, effort, next_obs, done, target_option, hidden_state in episode_data:
+            model.update_layer_weights(
+                layer_idx,
+                obs,
+                chosen_option,
+                reward,
+                effort,
+                next_obs,
+                done,
+                hidden_state,
+            )
+
+# Function to visualize option usage and terminations
+def visualize_option_usage(model, env):
+    option_usage = defaultdict(list)
+    termination_counts = defaultdict(int)
+
+    for x in range(env.size):
+        for y in range(env.size):
+            env.state = (x, y)
+            obs = env.get_observation()
+            hidden_states = model.init_hidden(1)
+            chosen_option = torch.tensor([random.randint(0, N_OPTIONS - 1)], dtype=torch.long, device=obs.device)
+
+            for _ in range(5):
+                output, values = model.forward(obs, chosen_option, hidden_states)
+                if values is not None:
+                    chosen_option_idx, _ = model.select_option(values, chosen_option)
+                    chosen_option = torch.tensor([chosen_option_idx], dtype=torch.long, device=obs.device)
+
+                if len(output) > 2 and output[2] is not None:
+                    termination_prob = output[2]
+                    if model.terminate_option(termination_prob):
+                        termination_counts[(x, y)] += 1
+
+            option_usage[(x, y)].append(chosen_option.item())
+
+    return option_usage, termination_counts
+
+# Main training loop
+rewards_over_time = []
+efforts_over_time = []
+for episode in range(N_EPISODES):
+    episode_data, total_reward, total_effort = run_episode(model, env, EPSILON)
+    update_model(model, episode_data)
+    rewards_over_time.append(total_reward)
+    efforts_over_time.append(total_effort)
+
+    if episode % TEST_EVERY_N_EPISODES == 0:
+        option_usage, termination_counts = visualize_option_usage(model, env)
+        print(f"Episode {episode}:")
+        for state, options in option_usage.items():
+            print(f"  State {state}: Option usage = {options}")
+        print(f"  Termination counts: {termination_counts}")
+
+# Plotting the results
+plt.figure(figsize=(12, 5))
+
+plt.style.use("rose-pine")
+plt.subplot(1, 2, 1)
+plt.plot(rewards_over_time)
+plt.title("Total Reward per Episode")
+plt.xlabel("Episode")
+plt.ylabel("Total Reward")
+
+plt.subplot(1, 2, 2)
+plt.plot(efforts_over_time)
+plt.title("Total Effort per Episode")
+plt.xlabel("Episode")
+plt.ylabel("Total Effort")
+
+plt.tight_layout()
+plt.show()

@@ -78,6 +78,7 @@ class HierarchicalGRU(nn.Module):
         contrasted = scaled_tensor + 0.5
         return contrasted
 
+
     def select_option(self, option_probabilities, chosen_option):
         dist = torch.distributions.Categorical(logits=option_probabilities)
         new_option_index = dist.sample()
@@ -207,11 +208,13 @@ class HierarchicalGRU(nn.Module):
         self.habitual_optimizer.zero_grad()
 
         # Clone hidden_state to avoid in-place modifications
-        hidden_state_clone = hidden_state.clone()
+        hidden_state_clone = hidden_state.detach().clone()
         print(f"update_layer_weights - hidden_state_clone shape: {hidden_state_clone.shape}")
 
         # Forward pass for the current layer
-        values, termination_output, new_hidden_state, output = self.forward_layer(layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs)
+        values, termination_output, new_hidden_state, output = self.forward_layer(
+            layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs
+        )
         print(f"new_hidden_state: {new_hidden_state.squeeze(0)}")
         print(f"  values shape: {values.shape}")
         print(f"  termination_output shape: {termination_output.shape if termination_output is not None else None}")
@@ -238,30 +241,24 @@ class HierarchicalGRU(nn.Module):
             if done:
                 target_q = reward.clone()
             else:
-                # Ensure target_option is within valid range [0, num_options - 1]
                 target_option = torch.clamp(target_option, 0, self.n_options - 1)
-
                 next_q = next_values.max(dim=1, keepdim=True)[0]
-                print(f"  next_q shape: {next_q.shape}")
 
-                # Incorporate effort into the target value calculation
                 if layer_idx == 0:
-                    # Higher layer: consider deliberation cost
                     current_return = reward - DELIBERATION_COST
+
+                    # Ensure chosen_option has the correct shape for gather
+                    chosen_option = chosen_option.view(-1, 1)
+
                     continue_value = (1 - termination_output) * next_values.gather(1, chosen_option)
                     switch_value = next_values.max(dim=1, keepdim=True)[0] - DELIBERATION_COST
                     target_q = current_return + GAMMA * torch.max(continue_value, switch_value)
-
                 else:
-                    # Lower layer: use immediate reward minus effort
-                    target_q = reward - effort + GAMMA * next_q # Effort is used here
+                    target_q = reward - effort + GAMMA * next_q
 
-        print(f"  target_q shape: {target_q.shape}")
-        print(f"  chosen_option: {chosen_option}")
         # Ensure chosen_option has the correct shape for gathering
         chosen_option = chosen_option.view(-1, 1)
         q_values = values.gather(1, chosen_option).squeeze(1)
-        print(f"  q_values shape: {q_values.shape}")
         value_loss = F.mse_loss(q_values, target_q.squeeze(1))
         print(f"  value_loss: {value_loss}")
 
@@ -269,53 +266,7 @@ class HierarchicalGRU(nn.Module):
         value_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.habitual_optimizer.step()
-
-        if layer_idx < self.n_layers - 1:
-            # control network update
-            self.control_optimizer.zero_grad()
-
-            # Compute advantage
-            print(f"  values shape: {values.shape}")
-            print(f"  chosen_option shape: {chosen_option.shape}")
-            advantage = values.gather(1, chosen_option) - values.max(1, keepdim=True)[0]
-            print(f"  advantage shape: {advantage.shape}")
-
-            # Compute loss for policy over options
-            policy_loss = -torch.log(F.softmax(values, dim=-1).gather(1, chosen_option)).mean()
-            print(f"  policy_loss: {policy_loss}")
-
-            # Compute loss for termination function
-            print(f"  termination_prob shape: {termination_output.shape if termination_output is not None else None}")
-            termination_loss = -torch.log(1 - termination_output.clamp(min=1e-8)).mean() if advantage.mean() < 0 else torch.tensor(0.0, requires_grad=True, device=values.device)
-            print(f"  termination_loss: {termination_loss}")
-
-            # Compute loss for attention diversity
-            attn_weights = self.attention(obs)
-            attention_diversity_loss = 0
-            for i in range(self.n_options):
-                for j in range(i + 1, self.n_options):
-                    attention_diversity_loss += F.cosine_similarity(attn_weights[:, i], attn_weights[:, j], dim=0)
-            print(f"  attention_diversity_loss: {attention_diversity_loss}")
-
-            # Compute loss for attention sparsity
-            attention_sparsity_loss = torch.norm(attn_weights, p=1, dim=-1).mean()
-            print(f"  attention_sparsity_loss: {attention_sparsity_loss}")
-
-            # Combine losses
-            total_control_loss = (
-                policy_loss
-                + termination_loss
-                + ATTENTION_DIVERSITY_WEIGHT * attention_diversity_loss
-                + ATTENTION_SPARSITY_WEIGHT * attention_sparsity_loss
-            )
-            print(f"  total_control_loss: {total_control_loss}")
-
-            # Update weights for control network
-            total_control_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            self.control_optimizer.step()
         print("-" * 30)
-
 
 
 
@@ -376,7 +327,7 @@ class GridWorld:
 # Initialize environment and agent
 env = GridWorld()
 INPUT_SIZE = env.size * env.size  # One-hot encoding of states
-HIDDEN_SIZE = 64
+HIDDEN_SIZE = 10
 model = HierarchicalGRU(INPUT_SIZE, HIDDEN_SIZE, N_OPTIONS, N_LAYERS)
 
 # Function to run an episode and collect data for training

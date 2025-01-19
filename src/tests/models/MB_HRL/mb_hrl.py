@@ -24,12 +24,14 @@ ATTENTION_SPARSITY_WEIGHT = 0.1  # Weight for attention sparsity loss
 DELIBERATION_COST = 0.01  # Cost for switching options
 
 class AttentionMechanism(nn.Module):
-    def __init__(self, input_size, n_options):
+    def __init__(self, input_size, hidden_size):
         super(AttentionMechanism, self).__init__()
-        self.attention_weights = nn.Linear(input_size, n_options)
+        self.attention_layer = nn.Linear(input_size, hidden_size)
 
     def forward(self, x):
-        attn_weights = F.softmax(self.attention_weights(x), dim=-1)
+        # x: [batch_size, input_size]
+        attn_weights = torch.tanh(self.attention_layer(x))
+        # attn_weights: [batch_size, hidden_size]
         return attn_weights
 
 class HierarchicalGRU(nn.Module):
@@ -46,13 +48,13 @@ class HierarchicalGRU(nn.Module):
         self.n_max_layer_iterations = n_max_layer_iterations
         self.current_option = None
 
-        self.attention = AttentionMechanism(input_size, n_options)
+        self.attention = AttentionMechanism(input_size, hidden_size)
 
         # Use GRU instead of GRUCell
         self.grus = nn.ModuleList()
-        self.grus.append(nn.GRU(input_size, hidden_size, batch_first=True))
+        self.grus.append(nn.GRU(hidden_size, hidden_size, batch_first=True))
         for i in range(1, n_layers):
-            self.grus.append(nn.GRU(input_size + hidden_size, hidden_size, batch_first=True))
+            self.grus.append(nn.GRU(hidden_size * 2, hidden_size, batch_first=True))
 
         self.value_heads = nn.ModuleList([
             nn.Linear(hidden_size, n_options) for _ in range(n_layers)
@@ -83,10 +85,8 @@ class HierarchicalGRU(nn.Module):
         print(f"Option probabilities: {option_probabilities}")
         print(f"New option index: {new_option_index}")
 
-        # Apply clamping only if current_option is not None
-        if self.current_option is not None and new_option_index == self.current_option:
-            # Clamp the sampled option index to ensure it's within the valid range
-            new_option_index = torch.clamp(new_option_index, 0, self.n_options - 1)
+        # Clamp the sampled option index to ensure it's within the valid range
+        new_option_index = torch.clamp(new_option_index, 0, self.n_options - 1)
 
         if self.current_option is not None and new_option_index != self.current_option:
             deliberation_cost = DELIBERATION_COST
@@ -94,13 +94,10 @@ class HierarchicalGRU(nn.Module):
             deliberation_cost = 0
         self.current_option = new_option_index.item()  # Convert to a scalar (Python number)
 
-        # Update chosen_option tensor (ensure it's a tensor and a scalar)
-        if not isinstance(chosen_option, torch.Tensor):
-            chosen_option = torch.tensor(self.current_option, dtype=torch.long, device=option_probabilities.device)
-        else:
-            chosen_option.fill_(self.current_option)  # Fill with the scalar value
+        # Create a new tensor for chosen_option instead of modifying it in-place
+        new_chosen_option = torch.tensor(self.current_option, dtype=torch.long, device=option_probabilities.device)
 
-        return self.current_option, deliberation_cost
+        return new_chosen_option, deliberation_cost
 
     def update_control_gain(self, layer_idx, reward, value):
         with torch.no_grad():
@@ -112,64 +109,37 @@ class HierarchicalGRU(nn.Module):
         return termination_prob > random.random()
 
     def forward_layer(self, layer_idx, x, hidden_state, chosen_option, obs):
-        print(f"  forward_layer - layer_idx: {layer_idx}")
-        print(f"  forward_layer - x shape: {x.shape}")
-        print(f"  forward_layer - hidden_state shape: {hidden_state.shape}")
-        print(f"  forward_layer - chosen_option: {chosen_option}")
-        print(f"  forward_layer - obs shape: {obs.shape}")
-        # Ensure chosen_option is a tensor with proper device
-        if not isinstance(chosen_option, torch.Tensor):
-            chosen_option = torch.tensor(chosen_option, dtype=torch.long, device=x.device)
-        elif chosen_option.device != x.device:
-            chosen_option = chosen_option.to(x.device)
 
         # Apply attention to the input observation (obs)
-        attn_weights = self.attention(obs)
-        print(f"  forward_layer - attn_weights shape: {attn_weights.shape}")
+        attn_weights = self.attention(obs)  # attn_weights: [batch_size, hidden_size]
 
-        # Ensure chosen_option has the correct shape for gathering
-        chosen_option_expanded = chosen_option.view(x.size(0), 1).expand(x.size(0), self.n_options)
-        print(f"  forward_layer - chosen_option_expanded shape: {chosen_option_expanded.shape}")
-
-        # Gather attention weights for the chosen option along dimension 1
-        attn_weights_for_option = attn_weights.gather(1, chosen_option_expanded)
-        print(f"  forward_layer - attn_weights_for_option shape: {attn_weights_for_option.shape}")
-
-        # Reshape for broadcasting and apply attention
-        x_weighted = obs * attn_weights_for_option.unsqueeze(-1) # Apply attention to obs
-        print(f"  forward_layer - x_weighted shape: {x_weighted.shape}")
+        # Apply attention weights
+        x_weighted = attn_weights  # x_weighted: [batch_size, hidden_size]
 
         # Get input for the current layer
         if layer_idx == 0:
-            input_tensor = x_weighted  # Input for the first layer is the observation
+            input_tensor = x_weighted.unsqueeze(1)  # Input for the first layer is the weighted observation
         else:
-            # Squeeze x_weighted and hidden_state before concatenation
-            print(f"  forward_layer - x_weighted.squeeze(1) shape: {x_weighted.squeeze(1).shape}")
-            print(f"  forward_layer - hidden_state.squeeze(0) shape: {hidden_state.squeeze(0).shape}")
-            input_tensor = torch.cat((x_weighted.squeeze(1), hidden_state.squeeze(0)), dim=-1)
-        print(f"  forward_layer - input_tensor shape: {input_tensor.shape}")
+            input_tensor = torch.cat((x_weighted, hidden_state.squeeze(0)), dim=-1).unsqueeze(1)
 
-        # Use GRU, which handles sequences
-        output, hidden_state = self.grus[layer_idx](input_tensor, hidden_state)
-        print(f"  forward_layer - output shape: {output.shape}")
-        print(f"  forward_layer - hidden_state shape: {hidden_state.shape}")
+        # Use GRUCell instead of GRU for more control over hidden state updates
+        _,new_hidden_state = self.grus[layer_idx](input_tensor.squeeze(1), hidden_state.squeeze(0))
+        print(f"new_hidden_state: {new_hidden_state}")
 
-        # Apply gain contrast to the hidden state
-        hidden_state = self.apply_gain_contrast(hidden_state, self.control_gains[layer_idx])
-        print(f"  forward_layer - hidden_state after gain contrast shape: {hidden_state.shape}")
+        # Apply gain contrast to a copy of the hidden state to avoid in-place modification
+        hidden_state_copy = new_hidden_state.clone()
+        hidden_state_copy = self.apply_gain_contrast(hidden_state_copy.unsqueeze(0), self.control_gains[layer_idx])
 
         # Get value, effort, and termination outputs
-        values = self.value_heads[layer_idx](hidden_state.squeeze(0)) # Use hidden_state for value heads
-        print(f"  forward_layer - values shape: {values.shape}")
+        values = self.value_heads[layer_idx](hidden_state_copy.squeeze(0))
 
         if layer_idx < self.n_layers - 1:
-            termination_prob = torch.sigmoid(self.termination_heads[layer_idx](hidden_state.squeeze(0))).gather(1, chosen_option.unsqueeze(1)) # Use hidden state for termination
-            print(f"  forward_layer - termination_prob shape: {termination_prob.shape}")
+            termination_prob = torch.sigmoid(self.termination_heads[layer_idx](hidden_state_copy.squeeze(0))).gather(1, chosen_option.unsqueeze(1))
         else:
             termination_prob = None
 
-        return values, termination_prob, hidden_state, output
-
+        return values, termination_prob, new_hidden_state.unsqueeze(0), new_hidden_state.unsqueeze(0)
+    
     def process_event(self, layer_idx, x, hidden_states, chosen_option, obs, reward=None, effort=None, timestep=0, accumulated_deliberation_cost=0):
         print(f"process_event - layer_idx: {layer_idx}")
         print(f"process_event - x shape: {x.shape}")
@@ -187,13 +157,12 @@ class HierarchicalGRU(nn.Module):
             layer_idx, x, hidden_states[layer_idx], chosen_option, obs
         )
 
-        # Option selection logic for higher layers (before recursion)
+        # Option selection logic for higher layenew_hidden_statesrs (before recursion)
         if layer_idx < self.n_layers - 1:
             if self.terminate_option(termination_output):
                 print(f"Option terminated for layer: {layer_idx}")
                 option_probabilities = values  # Use value as a proxy for option selection
                 new_chosen_option, deliberation_cost = self.select_option(option_probabilities, chosen_option)
-                chosen_option.fill_(new_chosen_option)  # Ensure valid option is chosen
                 print(f"New Chosen option: {new_chosen_option}")
                 accumulated_deliberation_cost += deliberation_cost
 
@@ -205,6 +174,8 @@ class HierarchicalGRU(nn.Module):
                     else:
                         new_hidden_states.append(hidden_states[i])
                 hidden_states = new_hidden_states
+                chosen_option = new_chosen_option  # Update chosen_option
+
 
         # Recursive call for lower layers
         if layer_idx < self.n_layers - 1:
@@ -240,7 +211,8 @@ class HierarchicalGRU(nn.Module):
         print(f"update_layer_weights - hidden_state_clone shape: {hidden_state_clone.shape}")
 
         # Forward pass for the current layer
-        values, termination_output, _, output = self.forward_layer(layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs)
+        values, termination_output, new_hidden_state, output = self.forward_layer(layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs)
+        print(f"new_hidden_state: {new_hidden_state.squeeze(0)}")
         print(f"  values shape: {values.shape}")
         print(f"  termination_output shape: {termination_output.shape if termination_output is not None else None}")
         print(f"  output shape: {output.shape}")
@@ -254,10 +226,11 @@ class HierarchicalGRU(nn.Module):
             next_values, _, _, next_output = self.forward_layer(
                 layer_idx,
                 next_obs.unsqueeze(1),
-                hidden_state.detach().clone(),
+                new_hidden_state.detach().clone(),
                 target_option,
                 next_obs
             )
+            print(f"new_hidden_state: {new_hidden_state.squeeze(0)}")
             print(f"  next_values shape: {next_values.shape}")
             print(f"  next_output shape: {next_output.shape}")
 
@@ -343,13 +316,17 @@ class HierarchicalGRU(nn.Module):
             self.control_optimizer.step()
         print("-" * 30)
 
+
+
+
+
     def forward(self, x, chosen_option, hidden_states=None):
         obs = x
         if hidden_states is None:
             hidden_states = self.init_hidden(x.size(0))
 
         # Process the event through the hierarchy
-        final_output, values, _ = self.process_event(0, x.unsqueeze(1), hidden_states, chosen_option, obs)
+        final_output, values, _ = self.process_event(0, x, hidden_states, chosen_option, obs)
 
         # Return both final_output and values from the lowest layer
         return final_output, values

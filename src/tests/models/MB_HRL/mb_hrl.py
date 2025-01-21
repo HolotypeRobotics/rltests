@@ -9,6 +9,8 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import numpy as np
 import copy
+import torchviz
+
 torch.autograd.set_detect_anomaly(True)
 
 # Constants (Hyperparameters)
@@ -78,13 +80,9 @@ class HierarchicalGRU(nn.Module):
         contrasted = scaled_tensor + 0.5
         return contrasted
 
-
     def select_option(self, option_probabilities, chosen_option):
         dist = torch.distributions.Categorical(logits=option_probabilities)
         new_option_index = dist.sample()
-        print(f"Chosen option: {chosen_option}")
-        print(f"Option probabilities: {option_probabilities}")
-        print(f"New option index: {new_option_index}")
 
         # Clamp the sampled option index to ensure it's within the valid range
         new_option_index = torch.clamp(new_option_index, 0, self.n_options - 1)
@@ -123,13 +121,12 @@ class HierarchicalGRU(nn.Module):
         else:
             input_tensor = torch.cat((x_weighted, hidden_state.squeeze(0)), dim=-1).unsqueeze(1)
 
-        # Use GRUCell instead of GRU for more control over hidden state updates
-        _,new_hidden_state = self.grus[layer_idx](input_tensor.squeeze(1), hidden_state.squeeze(0))
-        print(f"new_hidden_state: {new_hidden_state}")
+        # Use GRU
+        _, new_hidden_state = self.grus[layer_idx](input_tensor, hidden_state)
 
         # Apply gain contrast to a copy of the hidden state to avoid in-place modification
         hidden_state_copy = new_hidden_state.clone()
-        hidden_state_copy = self.apply_gain_contrast(hidden_state_copy.unsqueeze(0), self.control_gains[layer_idx])
+        hidden_state_copy = self.apply_gain_contrast(hidden_state_copy, self.control_gains[layer_idx])
 
         # Get value, effort, and termination outputs
         values = self.value_heads[layer_idx](hidden_state_copy.squeeze(0))
@@ -139,14 +136,9 @@ class HierarchicalGRU(nn.Module):
         else:
             termination_prob = None
 
-        return values, termination_prob, new_hidden_state.unsqueeze(0), new_hidden_state.unsqueeze(0)
+        return values, termination_prob, new_hidden_state, new_hidden_state # returning new_hidden_state twice since we removed the output variable
     
     def process_event(self, layer_idx, x, hidden_states, chosen_option, obs, reward=None, effort=None, timestep=0, accumulated_deliberation_cost=0):
-        print(f"process_event - layer_idx: {layer_idx}")
-        print(f"process_event - x shape: {x.shape}")
-        print(f"process_event - hidden_states shapes: {[h.shape for h in hidden_states]}")
-        print(f"process_event - chosen_option: {chosen_option}")
-        print(f"process_event - obs shape: {obs.shape}")
         # Ensure chosen_option is a tensor
         if not isinstance(chosen_option, torch.Tensor):
             chosen_option = torch.tensor(chosen_option, dtype=torch.long, device=x.device)
@@ -158,13 +150,11 @@ class HierarchicalGRU(nn.Module):
             layer_idx, x, hidden_states[layer_idx], chosen_option, obs
         )
 
-        # Option selection logic for higher layenew_hidden_statesrs (before recursion)
+        # Option selection logic for higher layers (before recursion)
         if layer_idx < self.n_layers - 1:
             if self.terminate_option(termination_output):
-                print(f"Option terminated for layer: {layer_idx}")
                 option_probabilities = values  # Use value as a proxy for option selection
                 new_chosen_option, deliberation_cost = self.select_option(option_probabilities, chosen_option)
-                print(f"New Chosen option: {new_chosen_option}")
                 accumulated_deliberation_cost += deliberation_cost
 
                 # Update hidden state for the new option
@@ -176,7 +166,6 @@ class HierarchicalGRU(nn.Module):
                         new_hidden_states.append(hidden_states[i])
                 hidden_states = new_hidden_states
                 chosen_option = new_chosen_option  # Update chosen_option
-
 
         # Recursive call for lower layers
         if layer_idx < self.n_layers - 1:
@@ -192,9 +181,6 @@ class HierarchicalGRU(nn.Module):
         # Ensure chosen_option is always valid
         chosen_option = torch.clamp(chosen_option, 0, self.n_options - 1)
 
-        print(f"process_event - returning - output shape: {output.shape}")
-        print(f"process_event - returning - values shape: {values.shape}")
-        print(f"process_event - returning - hidden_states shapes: {[h.shape for h in hidden_states]}")
         return output, values, hidden_states
 
     def init_hidden(self, batch_size):
@@ -202,50 +188,43 @@ class HierarchicalGRU(nn.Module):
         return [torch.zeros(1, batch_size, self.hidden_size, device=self.grus[0].weight_hh_l0.device) for _ in range(self.n_layers)]
 
     def update_layer_weights(self, layer_idx, obs, chosen_option, reward, effort, next_obs, done, hidden_state):
-        print("-" * 30)
-        print(f"Updating layer: {layer_idx}")
         # habitual network update
         self.habitual_optimizer.zero_grad()
+        if layer_idx < self.n_layers - 1:
+            self.control_optimizer.zero_grad()
 
         # Clone hidden_state to avoid in-place modifications
         hidden_state_clone = hidden_state.detach().clone()
-        print(f"update_layer_weights - hidden_state_clone shape: {hidden_state_clone.shape}")
+
 
         # Forward pass for the current layer
-        values, termination_output, new_hidden_state, output = self.forward_layer(
+        values, termination_output, new_hidden_state, _ = self.forward_layer(
             layer_idx, obs.unsqueeze(1), hidden_state_clone, chosen_option, obs
         )
-        print(f"new_hidden_state: {new_hidden_state.squeeze(0)}")
-        print(f"  values shape: {values.shape}")
-        print(f"  termination_output shape: {termination_output.shape if termination_output is not None else None}")
-        print(f"  output shape: {output.shape}")
 
         # Get the target option from the model's output
         target_option = values.argmax(dim=-1)
-        print(f"  target_option: {target_option}")
 
         # Compute loss for value function using TD error
         with torch.no_grad():
-            next_values, _, _, next_output = self.forward_layer(
+            next_values, _, _, _ = self.forward_layer(
                 layer_idx,
                 next_obs.unsqueeze(1),
                 new_hidden_state.detach().clone(),
+                # new_hidden_state,
                 target_option,
                 next_obs
             )
-            print(f"new_hidden_state: {new_hidden_state.squeeze(0)}")
-            print(f"  next_values shape: {next_values.shape}")
-            print(f"  next_output shape: {next_output.shape}")
 
             # Compute target Q-value with proper handling of termination
             if done:
-                target_q = reward.clone()
+                target_q = torch.tensor([reward], dtype=torch.float, device=values.device)
             else:
                 target_option = torch.clamp(target_option, 0, self.n_options - 1)
                 next_q = next_values.max(dim=1, keepdim=True)[0]
 
                 if layer_idx == 0:
-                    current_return = reward - DELIBERATION_COST
+                    current_return = torch.tensor([reward], dtype=torch.float, device=values.device) - DELIBERATION_COST
 
                     # Ensure chosen_option has the correct shape for gather
                     chosen_option = chosen_option.view(-1, 1)
@@ -254,20 +233,54 @@ class HierarchicalGRU(nn.Module):
                     switch_value = next_values.max(dim=1, keepdim=True)[0] - DELIBERATION_COST
                     target_q = current_return + GAMMA * torch.max(continue_value, switch_value)
                 else:
-                    target_q = reward - effort + GAMMA * next_q
+                    target_q = torch.tensor([reward], dtype=torch.float, device=values.device) - effort + GAMMA * next_q
 
         # Ensure chosen_option has the correct shape for gathering
         chosen_option = chosen_option.view(-1, 1)
         q_values = values.gather(1, chosen_option).squeeze(1)
-        value_loss = F.mse_loss(q_values, target_q.squeeze(1))
-        print(f"  value_loss: {value_loss}")
 
-        # Update weights for value function
-        value_loss.backward()
+        # Make sure target_q has the same shape as q_values
+        target_q = target_q.view_as(q_values)  # Reshape target_q
+
+        value_loss = F.mse_loss(q_values, target_q)
+
+        # Combine losses if it's a higher layer
+        total_loss = value_loss
+        if layer_idx < self.n_layers - 1:
+            # Compute advantage
+            advantage = values.gather(1, chosen_option) - values.max(1, keepdim=True)[0]
+
+            # Compute loss for policy over options
+            policy_loss = -torch.log(F.softmax(values, dim=-1).gather(1, chosen_option)).mean()
+
+            # Compute loss for termination function
+            termination_loss = -torch.log(1 - termination_output.clamp(min=1e-8)).mean() if advantage.mean() < 0 else torch.tensor(0.0, requires_grad=True, device=values.device)
+
+            # Compute loss for attention diversity
+            attn_weights = self.attention(obs)
+            attention_diversity_loss = 0
+            for i in range(self.n_options):
+                for j in range(i + 1, self.n_options):
+                    attention_diversity_loss += F.cosine_similarity(attn_weights[:, i], attn_weights[:, j], dim=0)
+
+            # Compute loss for attention sparsity
+            attention_sparsity_loss = torch.norm(attn_weights, p=1, dim=-1).mean()
+
+            # Combine control losses
+            total_control_loss = (
+                policy_loss
+                + termination_loss
+                + ATTENTION_DIVERSITY_WEIGHT * attention_diversity_loss
+                + ATTENTION_SPARSITY_WEIGHT * attention_sparsity_loss
+            )
+            total_loss += total_control_loss
+
+        # Update weights
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         self.habitual_optimizer.step()
-        print("-" * 30)
-
+        if layer_idx < self.n_layers - 1:
+            self.control_optimizer.step()
 
 
 
@@ -283,7 +296,7 @@ class HierarchicalGRU(nn.Module):
         return final_output, values
 
 # Test parameters
-N_EPISODES = 100
+N_EPISODES = 10
 MAX_STEPS = 50
 EPSILON = 0.3
 TEST_EVERY_N_EPISODES = 10
@@ -327,7 +340,7 @@ class GridWorld:
 # Initialize environment and agent
 env = GridWorld()
 INPUT_SIZE = env.size * env.size  # One-hot encoding of states
-HIDDEN_SIZE = 10
+HIDDEN_SIZE = 6
 model = HierarchicalGRU(INPUT_SIZE, HIDDEN_SIZE, N_OPTIONS, N_LAYERS)
 
 # Function to run an episode and collect data for training
@@ -359,9 +372,7 @@ def run_episode(model, env, epsilon=0.3):
         next_obs = env.get_observation()
 
         # Get the target option from the model's output (use values from the lowest layer)
-        print(f"Values: {values}")
         target_option = values.argmax(dim=-1)
-        print(f"Target option: {target_option}")
 
         # Apply accumulated deliberation cost
         reward = reward - accumulated_deliberation_cost
@@ -459,3 +470,20 @@ plt.ylabel("Total Effort")
 
 plt.tight_layout()
 plt.show()
+
+# Visualize the model using torchviz
+batch_size = 1
+input_size = env.size * env.size
+input_tensor = torch.randn(batch_size, input_size)
+chosen_option = torch.tensor([0], dtype=torch.long)
+hidden_states = model.init_hidden(batch_size)
+
+# Create a dummy input with the correct shape
+dummy_input = (input_tensor, chosen_option, hidden_states)
+
+# Pass the dummy input through the model
+output, values = model(*dummy_input)
+
+# Visualize the model graph
+dot = torchviz.make_dot(values, params=dict(model.named_parameters()))
+# dot.render("model", format="png")

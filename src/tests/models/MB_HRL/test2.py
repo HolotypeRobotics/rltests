@@ -140,6 +140,28 @@ class MetaRL:
         options[options == self.min_activation] = 0
         return options
 
+    # Rollout an option in the lower layer
+    def rollout_option_in_lower_layer(self, x, option_idx, layer_idx):
+        """
+        Rolls out the specified option in the lower layer
+        during the rollout, values are compared and the
+        best option should have a net increase in value 
+        relative to the alternatives, because the sequential 
+        comparison essentially sorts the probabilities based 
+        on net value resulting from the rollout.
+
+        This should take into account the effort too. 
+        Adjusting gaze before rollout should help predictions because the rollout stems from the initial observation.
+        It may be useful to build in a mechanism to adjust gaze in direction of the goal or subgoal.
+        """
+
+        if layer_idx == 0:
+            # Not sure what to do here yet
+            return
+        
+        with torch.no_grad():
+            current_gru = self.grus[layer_idx-1]
+
 
     def meta_step(self, x, env, layer_idx, ext, top=False):
         """
@@ -176,7 +198,19 @@ class MetaRL:
             last_best_effort = None
             # iterate through all the options not equal to 0, going from highest to lowest
             for option_idx in torch.argsort(affordances, descending=True):
-                                
+                if affordances[option_idx] == 0:
+                    break
+                # Get the option
+                option = self.options[option_idx]
+                # Get the value of the option
+                value = option['value']
+                # Get the effort of the option
+                effort = option['effort']
+                # If the value is greater than the last best value, then set the option as the best option
+                if last_best_value is None or value > last_best_value:
+                    last_best_option = option
+                    last_best_value = value
+                    last_best_effort = effort
 
 
             # Check if we should terminate or take another step in the environment/layer

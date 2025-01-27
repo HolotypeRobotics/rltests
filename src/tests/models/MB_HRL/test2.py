@@ -59,17 +59,16 @@ class OnlineGRU(nn.Module):
         gru_out, self.hidden = self.gru(x, self.hidden)
         self.hidden = self.hidden.detach()
 
-        # Estimate value using the value head
-        value_estimate = self.value_head(gru_out[-1, 0, :]).squeeze()
+        value_estimate = self.value_head(self.hidden).squeeze()
 
         # Estimate termination probability using the termination head
-        termination_logit = self.termination_head(gru_out[-1, 0, :]).squeeze()
+        termination_logit = self.termination_head(self.hidden).squeeze()
         self.termination_prob = torch.sigmoid(termination_logit).item()  # Update termination probability
 
         if self.has_output_layer:
-            return self.output_layer(gru_out[-1, 0, :]), value_estimate, self.termination_prob
+            return self.output_layer(gru_out[-1, 0, :]), value_estimate, self.termination_prob, termination_logit
         else:
-            return gru_out[-1, 0, :], value_estimate, self.termination_prob
+            return gru_out[-1, 0, :], value_estimate, self.termination_prob, termination_logit
 
     def update_weights(self, value_estimate, termination_logit, value_target, termination_target, layer_idx):
         print(f"{'   ' * (layer_idx)}Layer {layer_idx} update")
@@ -92,23 +91,25 @@ class OnlineGRU(nn.Module):
 
     def calculate_termination_target(self, continue_value, switch_value):
         # Calculate termination target based on value difference
-        # If continue_value > switch_value, termination target is 0 (continue)
-        # Otherwise, termination target is 1 (switch)
-        # return torch.tensor(0.0 if continue_value > switch_value else 1.0, dtype=torch.float)
         value_diff = continue_value - switch_value
-        return 1 / (1 + np.exp(value_diff))
+        return torch.tensor(1 / (1 + np.exp(value_diff)), dtype=torch.float)
 
     def reset_accumulated_values(self):
         self.accumulated_reward = 0
         self.accumulated_effort = 0
 
+    def should_terminate(self):
+        # Decide whether to terminate based on termination probability
+        return torch.rand(1).item() < self.termination_prob
 class MetaRL:
-    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, steps_per_layer, gamma=0.99, switch_cost=0.1):
+    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.5, min_activation=0.1):
         self.n_layers = len(hidden_sizes)
         self.grus = nn.ModuleList()
-        self.steps_per_layer = steps_per_layer
         self.gamma = gamma
         self.switch_cost = switch_cost
+        self.termination_threshold = termination_threshold
+        self.min_activation = 0.1  # Minimum activation threshold for options
+
 
         for i in range(self.n_layers):
             print(f"Creating GRU {i + 1}/{self.n_layers}")
@@ -130,11 +131,28 @@ class MetaRL:
                 switch_cost=self.switch_cost
             ))
 
-    def meta_step(self, x, targets, layer_idx, ext, reward, effort, top=False):
+    # Gets the options based on the confidence of each option
+    def get_options(self, x):
+        """
+        Filter the options to the range [min_activation, 1]
+        """
+        options = torch.clamp_min(x, self.min_activation)
+        options[options == self.min_activation] = 0
+        return options
+
+
+    def meta_step(self, x, env, layer_idx, ext, top=False):
         """
         Perform the meta-learning step for the specified layer and recursively process lower layers.
         """
+        # Get the current GRU layer
+        current_gru = self.grus[layer_idx]
+        # Initialize loss, reward, effort
         loss = 0
+        total_reward = 0
+        total_effort = 0
+
+
         # Ensure x and ext are 2D before concatenation
         if top == False:
             if x.dim() == 1:
@@ -143,68 +161,61 @@ class MetaRL:
                 ext = ext.unsqueeze(0)  # Reshape ext if needed
             x = torch.cat([x, ext], dim=1)  # Concatenate x and ext
 
-        # Get the current GRU layer
-        current_gru = self.grus[layer_idx]
-
-        # Accumulate reward and effort for the current layer
-        current_gru.accumulated_reward += reward
-        current_gru.accumulated_effort += effort
 
         for step in range(self.steps_per_layer[layer_idx]):
 
             # Forward pass for the current layer
-            output, value_estimate, termination_prob = current_gru(x, layer_idx)
-            termination_logit = current_gru.termination_head(output).squeeze()
+            output, value_estimate, termination_prob, termination_logit = current_gru(x, layer_idx)
 
+            # Get the options based on the confidence of each option
+            affordances = self.get_options(output)
+
+            # Look at each option, holding the last one in working memory to compare it to the current one
+            last_best_option = None
+            last_best_value = None
+            last_best_effort = None
+            # iterate through all the options not equal to 0, going from highest to lowest
+            for option_idx in torch.argsort(affordances, descending=True):
+                                
+
+
+            # Check if we should terminate or take another step in the environment/layer
+            termination_logit = current_gru.termination_head(output).squeeze()
+            termination_prob = torch.sigmoid(termination_logit).item()
+            if termination_prob > self.termination_threshold:
+                break
+
+            # Then observe the reward and effort
             if layer_idx > 0:
                 # Recursively call meta_step for the lower layer
-                lower_layer_loss = self.meta_step(x=output, targets=targets, layer_idx=layer_idx - 1, ext=ext, reward=reward, effort=effort)
-                loss += lower_layer_loss
-
-                # Get the value estimate from the lower layer (if it exists)
-                _, lower_value_estimate, _ = self.grus[layer_idx - 1](output, layer_idx - 1)
-
-                # Calculate switch value (value of switching to the best other option)
-                # For simplicity, let's assume the best other option is the one with the highest value
-                # In a more complex scenario, you might consider other factors or explore other options
-                switch_value = lower_value_estimate.detach() - self.switch_cost if layer_idx > 0 else torch.tensor(0.0)
-
+                l,r,e = self.meta_step(x=output, env=env, layer_idx=layer_idx - 1, ext=ext)
+                loss += l
+                reward += r
+                effort += e
             else:
-                switch_value = torch.tensor(0.0)  # No lower layer to switch to
+                r, e = env.step(output) # Placeholder function
+                reward += r
+                effort += e
+
+            # Update weights for the current layer based on what we observed
+
+            # TODO: Implement logic for switching
+            switch_value = torch.randn(1).item()  # Placeholder value
 
             # Calculate continue value (value of continuing with the current option)
-            continue_value = current_gru.accumulated_reward - current_gru.accumulated_effort + (
-                        self.gamma * value_estimate.detach() * (1 - termination_prob))
+            continue_value = reward - effort + (self.gamma * value_estimate.detach() * (1 - termination_prob))
 
             # Calculate termination target based on whether to continue or switch
             termination_target = current_gru.calculate_termination_target(continue_value, switch_value)
 
             # Calculate value target (TD target)
-            value_target = current_gru.accumulated_reward - current_gru.accumulated_effort + (
-                        self.gamma * value_estimate.detach() * (1 - termination_target))
+            value_target = reward - effort + (self.gamma * value_estimate.detach() * (1 - termination_target))
 
             # Update weights for the current layer
             layer_loss = current_gru.update_weights(value_estimate, termination_logit, value_target, termination_target, layer_idx)
             loss += layer_loss
 
-            # Decide whether to terminate the current layer based on termination probability
-            if torch.rand(1).item() < termination_prob:
-                current_gru.reset_accumulated_values()
-                break
-
-        return loss
-
-    def get_reward(self, layer_idx, step):
-        # Placeholder function to simulate getting a reward from the environment
-        # You'll need to implement the actual logic based on your task
-        # For now, let's just return a random value
-        return np.random.rand()
-
-    def get_effort(self, layer_idx, step):
-        # Placeholder function to simulate effort associated with an action
-        # You'll need to implement the actual logic based on your task
-        # For now, let's just return a constant value
-        return 0.1
+        return loss, reward, effort
 
 if __name__ == "__main__":
     # Define parameters
@@ -216,22 +227,4 @@ if __name__ == "__main__":
 
     # Create the MetaRL model
     meta_model = MetaRL(input_size, hidden_sizes, output_size, learning_rates, steps_per_layer)
-
-    # Example training loop
-    for epoch in range(5):
-        # Generate dummy data
-        x = torch.randn(1, input_size)
-        targets = []
-        for i in range(meta_model.n_layers):
-            out_size = hidden_sizes[i] if i > 0 else output_size
-            targets.append(torch.randn(out_size))
-
-        # Get reward and effort (you'll need to define how these are obtained)
-        reward = meta_model.get_reward(meta_model.n_layers - 1, epoch)  # Placeholder function
-        effort = meta_model.get_effort(meta_model.n_layers - 1, epoch)  # Placeholder function
-
-        # Perform meta-learning step
-        loss = meta_model.meta_step(x=x, ext=x, targets=targets, layer_idx=meta_model.n_layers - 1, reward=reward, effort=effort, top=True)
-
-        print(f"\nEpoch {epoch + 1}")
-        print(f"Total Loss: {loss}")
+...

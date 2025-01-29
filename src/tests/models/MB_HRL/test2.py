@@ -88,6 +88,19 @@ class OnlineGRU(nn.Module):
         self.optimizer.step()
 
         return total_loss.item()
+    def compare_to_best(self, current_value):
+        """
+        Compares the current value to the best option value, implementing a form of 
+        repression/supression.
+        """
+        # Simple comparison - can be made more sophisticated
+        value_diff = current_value - self.best_option_value
+        
+        # If the current value is better, update the best option value
+        if value_diff > 0:
+            self.best_option_value = current_value
+        
+        return value_diff
 
     def calculate_termination_target(self, continue_value, switch_value):
         # Calculate termination target based on value difference
@@ -97,6 +110,8 @@ class OnlineGRU(nn.Module):
     def reset_accumulated_values(self):
         self.accumulated_reward = 0
         self.accumulated_effort = 0
+        self.best_option_value = -float('inf')  # Reset best option value
+
 
     def should_terminate(self):
         # Decide whether to terminate based on termination probability
@@ -192,25 +207,24 @@ class MetaRL:
             # Get the options based on the confidence of each option
             affordances = self.get_options(output)
 
+            
             # Look at each option, holding the last one in working memory to compare it to the current one
             last_best_option = None
             last_best_value = None
             last_best_effort = None
             # iterate through all the options not equal to 0, going from highest to lowest
             for option_idx in torch.argsort(affordances, descending=True):
-                if affordances[option_idx] == 0:
+                sub_option_probability = affordances[option_idx]
+                if sub_option_probability == 0:
                     break
                 # Get the option
-                option = self.options[option_idx]
-                # Get the value of the option
-                value = option['value']
-                # Get the effort of the option
-                effort = option['effort']
+                sub_option_value = self.rollout_option_in_lower_layer(option_idx)
                 # If the value is greater than the last best value, then set the option as the best option
-                if last_best_value is None or value > last_best_value:
-                    last_best_option = option
-                    last_best_value = value
-                    last_best_effort = effort
+                self.compare_option_values(last_best_value, sub_option_value)
+                if last_best_value is None or sub_option_value > last_best_value:
+                    last_best_option = sub_option_probability
+                    last_best_value = sub_option_value
+
 
 
             # Check if we should terminate or take another step in the environment/layer

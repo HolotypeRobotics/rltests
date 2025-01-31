@@ -17,10 +17,8 @@ class OnlineGRU(nn.Module):
         # GRU layer
         self.gru = nn.GRU(input_size, hidden_size, batch_first=False)
         self.value_head = nn.Linear(hidden_size, 1)  # For value estimation
-        self.termination_head = nn.Sequential(
-            nn.Linear(hidden_size + 2, 1),  # +2 for continue/switching values
-            nn.Sigmoid()
-        )
+        self.termination_head = nn.Linear(hidden_size, 1)  # For termination probability
+        self.prediction_layer = nn.Linear(hidden_size, input_size) # Predictis the next input state
 
         # Output layer only if specified
         if has_output_layer:
@@ -66,6 +64,8 @@ class OnlineGRU(nn.Module):
         gru_out, self.hidden = self.gru(x, self.hidden)
         self.hidden = self.hidden.detach()
 
+        state_prediction = self.prediction_layer(self.hidden).squeeze()
+
         value_estimate = self.value_head(self.hidden).squeeze()
 
         # Estimate termination probability using the termination head
@@ -73,21 +73,24 @@ class OnlineGRU(nn.Module):
         self.termination_prob = torch.sigmoid(termination_logit).item()  # Update termination probability
 
         if self.has_output_layer:
-            return self.output_layer(gru_out[-1, 0, :]), value_estimate, self.termination_prob, termination_logit
+            return self.output_layer(gru_out[-1, 0, :]), value_estimate, state_prediction, self.termination_prob, termination_logit
         else:
-            return gru_out[-1, 0, :], value_estimate, self.termination_prob, termination_logit
+            return gru_out[-1, 0, :], value_estimate, self.termination_prob, state_prediction, termination_logit
 
-    def update_weights(self, value_estimate, termination_logit, value_target, termination_target, layer_idx):
+    def update_weights(self, value_estimate, state_prediction, termination_logit, value_target, actual_state, termination_target, layer_idx):
         print(f"{'   ' * (layer_idx)}Layer {layer_idx} update")
 
         # Calculate value loss
         value_loss = self.value_criterion(value_estimate, value_target)
 
+        # Calculate state prediction loss
+        state_prediction_loss = self.value_criterion(state_prediction, actual_state)
+
         # Calculate termination loss
         termination_loss = self.termination_criterion(termination_logit, termination_target)
 
         # Total loss
-        total_loss = value_loss + termination_loss
+        total_loss = value_loss + termination_loss + state_prediction_loss
 
         # Update weights
         self.optimizer.zero_grad()
@@ -111,13 +114,14 @@ class OnlineGRU(nn.Module):
 
 
 class MetaRL:
-    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.5, min_activation=0.1):
+    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.5, min_activation=0.1, num_max_steps=100):
         self.n_layers = len(hidden_sizes)
         self.grus = nn.ModuleList()
         self.gamma = gamma
         self.switch_cost = switch_cost
         self.termination_threshold = termination_threshold
-        self.min_activation = 0.1  # Minimum activation threshold for options
+        self.min_activation = min_activation  # Minimum activation threshold for options
+        self.num_max_steps = num_max_steps  # Maximum number of steps to take in the environment
 
 
         for i in range(self.n_layers):
@@ -149,6 +153,26 @@ class MetaRL:
         options[options == self.min_activation] = 0
         return options
 
+    def rollout_option(self, ext, layer_idx, option_idx):
+        """
+        Perform a rollout for a single option in the specified layer.
+        """
+        current_gru = self.grus[layer_idx]
+        # Set the option as the 1 hot input
+        x = torch.zeros(self.grus[layer_idx].hidden_size)
+        x[option_idx] = 1
+        accumulated_reward = 0
+        with torch.no_grad():
+            for t in range(self.num_max_steps):
+                inputs = torch.cat([x, ext], dim=1)  # Concatenate x and ext
+                output, reward, termination_prob, ext, termination_logit = current_gru(inputs, layer_idx)
+                accumulated_reward += ((self.gamma **t) * reward) # Accumulate reward discounted over time
+                if termination_prob > self.termination_threshold:
+                    break
+
+        return accumulated_reward
+
+
     def meta_step(self, x, env, layer_idx, ext, top=False):
         """
         Perform the meta-learning step for the specified layer and recursively process lower layers.
@@ -158,8 +182,6 @@ class MetaRL:
         # Initialize loss, reward, effort
         loss = 0
         total_reward = 0
-        total_effort = 0
-
 
         # Ensure x and ext are 2D before concatenation
         if top == False:
@@ -173,16 +195,19 @@ class MetaRL:
         for step in range(self.steps_per_layer[layer_idx]):
 
             # Forward pass for the current layer
-            output, option_value_estimate, termination_prob, termination_logit = current_gru(x, layer_idx)
+            output, option_value_estimate, termination_prob, state_prediction, termination_logit = current_gru(x, layer_idx)
+
+            # Check if we should terminate or take another step in the environment/layer
+            if termination_prob > self.termination_threshold:
+                break
 
             # Get the options based on the confidence of each option
             affordances = self.filter_options(output)
 
-            
             # Look at each option, holding the last one in working memory to compare it to the current one
             last_best_sub_option = None
-            last_best_value  = option_value_estimate
-            last_best_effort = None
+            chosen_option_value  = option_value_estimate.clone().detach()
+            switch_value = 0
 
             # iterate through all the options not equal to 0, going from highest to lowest
             for option_idx in torch.argsort(affordances, descending=True):
@@ -190,25 +215,22 @@ class MetaRL:
                 if sub_option_probability == 0:
                     break
                 # Get the option
-                sub_option_value, sub_option_effort = self.meta_step(x, env, option_idx, ext)
+                sub_option_value = self.rollout_option(x, ext, layer_idx, option_idx)
 
                 # If the value is greater than the last best value, then set the option as the best option
-                if self.compare_option_values(next_value=sub_option_value, previous_value=last_best_value):
+                if self.compare_option_values(next_value=sub_option_value, previous_value=chosen_option_value):
                     last_best_sub_option = option_idx
-                    last_best_value = sub_option_value
+                    switch_value = chosen_option_value # setting the value for the alternative option, since we switched, and will have to switch back to regain the value
+                    chosen_option_value = sub_option_value # the value for the chosen option
 
                 # Clear unused option
                 else:
                     affordances[layer_idx] = 0
 
-            # Todo: Set affordanes to one hot to pass down
-
-
-            # Check if we should terminate or take another step in the environment/layer
-            termination_logit = current_gru.termination_head(output).squeeze()
-            termination_prob = torch.sigmoid(termination_logit).item()
-            if termination_prob > self.termination_threshold:
-                break
+            # Choose the best option
+            # set the output to the best option (1-hot)
+            output = torch.zeros_like(output)
+            output[last_best_sub_option] = 1
 
             # Then observe the reward and effort
             if layer_idx > 0:
@@ -224,20 +246,17 @@ class MetaRL:
 
             # Update weights for the current layer based on what we observed
 
-            # TODO: Implement logic for switching
-            switch_value = torch.randn(1).item()  # Placeholder value
-
             # Calculate continue value (value of continuing with the current option)
-            continue_value = reward - effort + (self.gamma * value_estimate.detach() * (1 - termination_prob))
+            continue_value = reward - effort + (self.gamma * chosen_option_value * (1 - termination_prob))
 
             # Calculate termination target based on whether to continue or switch
             termination_target = current_gru.calculate_termination_target(continue_value, switch_value)
 
             # Calculate value target (TD target)
-            value_target = reward - effort + (self.gamma * value_estimate.detach() * (1 - termination_target))
+            value_target = reward - effort + (self.gamma * chosen_option_value * (1 - termination_target))
 
             # Update weights for the current layer
-            layer_loss = current_gru.update_weights(value_estimate, termination_logit, value_target, termination_target, layer_idx)
+            layer_loss = current_gru.update_weights(option_value_estimate, termination_logit, state_prediction, value_target, termination_target, layer_idx)
             loss += layer_loss
 
         return loss, reward, effort

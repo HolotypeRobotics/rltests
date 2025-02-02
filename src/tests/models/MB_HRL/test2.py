@@ -3,16 +3,25 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
+# TODO:
+# - Implement attention network functionality to external GRU inputs
+# - Imlement control functionality
+# - Simulate head movements or gaze shifts that correspond to the current focus of mental simulation.
+# - Prediction error should trigger option switching trhough diminishing confidence in the current option
+#   - It should also effect the learning rate, and control by increasing both
+
 class OnlineGRU(nn.Module):
-    def __init__(self, input_size, hidden_size, has_output_layer=False, output_size=None, learning_rate=0.01, gamma=0.99, switch_cost=0.1):
+    def __init__(self, input_size, hidden_size, has_output_layer=False, output_size=None, learning_rate=0.01, gamma=0.99, switch_cost=0.1, termination_threshold=0.9):
         super(OnlineGRU, self).__init__()
         print(f"Creating gru with input_size: {input_size}, hidden_size: {hidden_size}, output_size: {output_size}")
 
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.has_output_layer = has_output_layer
         self.gamma = gamma
         self.switch_cost = switch_cost
         self.learning_rate = learning_rate
+        self.output_size = self.hidden_size if output_size is None else output_size
 
         # GRU layer
         self.gru = nn.GRU(input_size, hidden_size, batch_first=False)
@@ -40,16 +49,12 @@ class OnlineGRU(nn.Module):
         self.recent_predicted_value = 0
 
         # Termination probability
-        self.termination_prob = 0.5
-
-        # Used as threshold for choosing options
-        self.option_value_threshold = 0.5
+        self.termination_threshold = termination_threshold
 
     def init_hidden(self):
         return torch.zeros(1, 1, self.hidden_size)
 
-    def forward(self, x, layer_idx):
-        print(f"{'   ' * (layer_idx)}Layer {layer_idx} forward")
+    def forward(self, x, execute=True):
 
         # Ensure hidden state is initialized correctly
         if self.hidden is None:
@@ -70,12 +75,13 @@ class OnlineGRU(nn.Module):
 
         # Estimate termination probability using the termination head
         termination_logit = self.termination_head(self.hidden).squeeze()
-        self.termination_prob = torch.sigmoid(termination_logit).item()  # Update termination probability
+        termination_prob = torch.sigmoid(termination_logit).item()  # Update termination probability
 
-        if self.has_output_layer:
-            return self.output_layer(gru_out[-1, 0, :]), value_estimate, state_prediction, self.termination_prob, termination_logit
+        # Output action only if bottom layer, and we are not planning
+        if self.has_output_layer and execute == True:
+            return self.output_layer(gru_out[-1, 0, :]), value_estimate, state_prediction, termination_prob, termination_logit
         else:
-            return gru_out[-1, 0, :], value_estimate, self.termination_prob, state_prediction, termination_logit
+            return gru_out[-1, 0, :], value_estimate, state_prediction,  termination_prob, termination_logit
 
     def update_weights(self, value_estimate, state_prediction, termination_logit, value_target, actual_state, termination_target, layer_idx):
         print(f"{'   ' * (layer_idx)}Layer {layer_idx} update")
@@ -98,9 +104,7 @@ class OnlineGRU(nn.Module):
         self.optimizer.step()
 
         return total_loss.item()
-    
-    def compare_option_values(self, next_value, previous_value, alpha=0.8, beta=0.2):
-        return (alpha * next_value / (1 + (beta * previous_value))) > self.option_value_threshold
+
 
     def calculate_termination_target(self, continue_value, switch_value):
         # Calculate termination target based on value difference
@@ -112,9 +116,8 @@ class OnlineGRU(nn.Module):
         self.accumulated_effort = 0
         self.best_option_value = -float('inf')  # Reset best option value
 
-
 class MetaRL:
-    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.5, min_activation=0.1, num_max_steps=100):
+    def __init__(self, input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.5, min_activation=0.1, num_max_steps=100, option_value_threshold=0.5):
         self.n_layers = len(hidden_sizes)
         self.grus = nn.ModuleList()
         self.gamma = gamma
@@ -122,7 +125,7 @@ class MetaRL:
         self.termination_threshold = termination_threshold
         self.min_activation = min_activation  # Minimum activation threshold for options
         self.num_max_steps = num_max_steps  # Maximum number of steps to take in the environment
-
+        self.option_value_threshold = option_value_threshold  # Threshold for option value comparison
 
         for i in range(self.n_layers):
             print(f"Creating GRU {i + 1}/{self.n_layers}")
@@ -159,21 +162,61 @@ class MetaRL:
         """
         current_gru = self.grus[layer_idx]
         # Set the option as the 1 hot input
-        x = torch.zeros(self.grus[layer_idx].hidden_size)
+        x = torch.zeros(current_gru.input_size if layer_idx == self.n_layers - 1 else self.grus[layer_idx + 1].hidden_size)
         x[option_idx] = 1
+        print(f"Rollout option {option_idx} in layer {layer_idx}")
+        print(f"Layer activity: {x.unsqueeze(0)}")
         accumulated_reward = 0
         with torch.no_grad():
             for t in range(self.num_max_steps):
-                inputs = torch.cat([x, ext], dim=1)  # Concatenate x and ext
-                output, reward, termination_prob, ext, termination_logit = current_gru(inputs, layer_idx)
-                accumulated_reward += ((self.gamma **t) * reward) # Accumulate reward discounted over time
+                _, predicted_reward, ext, termination_prob, _ = self.feed(x, ext, layer_idx, execute=False)
+                accumulated_reward += ((self.gamma **t) * predicted_reward) # Accumulate reward discounted over time
                 if termination_prob > self.termination_threshold:
                     break
 
         return accumulated_reward
 
+    def apply_control_over_options(self, x, option_idx):
+        """
+        Apply control over the options by contrasting the values based on
+        the chosen option, and the frequency of negative prediction errors.
+        """
+        # Use sigmoid, with a gain based on error frequency
+        x = torch.sigmoid(x - option_idx)
 
-    def meta_step(self, x, env, layer_idx, ext, top=False):
+        return x
+    
+    def feed(self, x, ext, layer_idx, execute=True):
+        # Ensure x and ext are 2D before concatenation
+        print(f"{'   ' * (layer_idx)}Layer {layer_idx} feed")
+        print(f"{'   ' * (layer_idx)}Input shape before cat : {x.shape}")
+        print(f"{'   ' * (layer_idx)}Ext shape before cat: {ext.shape}")
+
+        if layer_idx < self.n_layers - 1: # If not the top layer
+            if x.dim() == 1:
+                x = x.unsqueeze(0)  # Reshape to (1, hidden_size)
+    
+            if ext.dim() == 1:
+                ext = ext.unsqueeze(0)  # Reshape ext if needed
+
+            # Take only the first input_size elements from ext
+            ext = ext[:, :self.grus[layer_idx].input_size - x.size(1)]
+            x = torch.cat([x, ext], dim=1)  # Concatenate x and ext
+
+        print(f"Layer {layer_idx}. Input size: {self.grus[layer_idx].input_size} vs {x.shape}")
+        print(f"{'   ' * (layer_idx)}Layer {layer_idx} feed. Input: {x}")
+
+        out = self.grus[layer_idx](x, execute)
+
+        print(f"Layer {layer_idx} Output size: {self.grus[layer_idx].output_size} vs {out[0].shape}")
+        print(f"{'   ' * (layer_idx)}Output: {out[0]}")
+
+        return out
+
+    def compare_option_values(self, next_value, previous_value, alpha=0.8, beta=0.2):
+        return (alpha * next_value / (1 + (beta * previous_value))) > self.option_value_threshold
+
+    def meta_step(self, x, env, layer_idx, ext):
         """
         Perform the meta-learning step for the specified layer and recursively process lower layers.
         """
@@ -183,54 +226,58 @@ class MetaRL:
         loss = 0
         total_reward = 0
 
-        # Ensure x and ext are 2D before concatenation
-        if top == False:
-            if x.dim() == 1:
-                x = x.unsqueeze(0)  # Reshape to (1, hidden_size)
-            if ext.dim() == 1:
-                ext = ext.unsqueeze(0)  # Reshape ext if needed
-            x = torch.cat([x, ext], dim=1)  # Concatenate x and ext
+        reward = 0
+        effort = 0
 
-
-        for step in range(self.steps_per_layer[layer_idx]):
+        for step in range(self.num_max_steps):
 
             # Forward pass for the current layer
-            output, option_value_estimate, termination_prob, state_prediction, termination_logit = current_gru(x, layer_idx)
+            output, option_value_estimate, state_prediction, termination_prob, termination_logit = self.feed(x=x, ext=ext, layer_idx=layer_idx)
 
             # Check if we should terminate or take another step in the environment/layer
             if termination_prob > self.termination_threshold:
+                print(f"Terminating at layer {layer_idx}, step {step}, termination_prob: {termination_prob} > {self.termination_threshold}")
                 break
 
             # Get the options based on the confidence of each option
             affordances = self.filter_options(output)
 
             # Look at each option, holding the last one in working memory to compare it to the current one
-            last_best_sub_option = None
+            last_best_sub_option = torch.argmax(affordances)
             chosen_option_value  = option_value_estimate.clone().detach()
-            switch_value = 0
+            chosen_option_confidence = 0
+            alternative_option_value = 0
+            alternative_option_confidence = 0
 
             # iterate through all the options not equal to 0, going from highest to lowest
             for option_idx in torch.argsort(affordances, descending=True):
-                sub_option_probability = affordances[option_idx]
-                if sub_option_probability == 0:
+                sub_option_confidence = affordances[option_idx]
+                if sub_option_confidence == 0:
                     break
-                # Get the option
-                sub_option_value = self.rollout_option(x, ext, layer_idx, option_idx)
+
+                # Get the sub-option value for the current option by rolling out the option in the lower layer
+                if layer_idx > 0:
+                    sub_option_value = self.rollout_option(ext=ext, layer_idx=layer_idx - 1, option_idx=option_idx)
+                else:
+                    sub_option_value = chosen_option_value
 
                 # If the value is greater than the last best value, then set the option as the best option
                 if self.compare_option_values(next_value=sub_option_value, previous_value=chosen_option_value):
                     last_best_sub_option = option_idx
-                    switch_value = chosen_option_value # setting the value for the alternative option, since we switched, and will have to switch back to regain the value
-                    chosen_option_value = sub_option_value # the value for the chosen option
 
-                # Clear unused option
+                    alternative_option_value = chosen_option_value # setting the value for the alternative option, since we switched, and will have to switch back to regain the value
+                    alternative_option_confidence = chosen_option_confidence
+
+                    chosen_option_value = sub_option_value # The value for the chosen option
+                    chosen_option_confidence = sub_option_confidence # The confidence for the chosen option
+
+                # Eliminate unused option
                 else:
-                    affordances[layer_idx] = 0
+                    affordances[option_idx] = 0
 
             # Choose the best option
             # set the output to the best option (1-hot)
-            output = torch.zeros_like(output)
-            output[last_best_sub_option] = 1
+            output = self.apply_control_over_options(output, last_best_sub_option)
 
             # Then observe the reward and effort
             if layer_idx > 0:
@@ -247,7 +294,9 @@ class MetaRL:
             # Update weights for the current layer based on what we observed
 
             # Calculate continue value (value of continuing with the current option)
-            continue_value = reward - effort + (self.gamma * chosen_option_value * (1 - termination_prob))
+            # continue_value = reward - effort + (self.gamma * chosen_option_value * (1 - termination_prob))
+            continue_value = chosen_option_value * chosen_option_confidence
+            switch_value =  alternative_option_value * alternative_option_confidence
 
             # Calculate termination target based on whether to continue or switch
             termination_target = current_gru.calculate_termination_target(continue_value, switch_value)
@@ -256,10 +305,22 @@ class MetaRL:
             value_target = reward - effort + (self.gamma * chosen_option_value * (1 - termination_target))
 
             # Update weights for the current layer
-            layer_loss = current_gru.update_weights(option_value_estimate, termination_logit, state_prediction, value_target, termination_target, layer_idx)
+            layer_loss = current_gru.update_weights(option_value_estimate, state_prediction, termination_logit, value_target, env.state, termination_target, layer_idx)
             loss += layer_loss
 
         return loss, reward, effort
+
+# Dummy environment for testing
+class DummyEnv:
+    def __init__(self, state_size):
+        self.state_size = state_size
+        self.state = np.zeros(state_size)
+    def step(self, action):
+        # Replace this with your actual environment logic
+        reward = np.random.rand()
+        state = np.random.rand(self.state_size)
+        effort = 0.1
+        return reward, effort
 
 if __name__ == "__main__":
     # Define parameters
@@ -267,8 +328,22 @@ if __name__ == "__main__":
     hidden_sizes = [20, 15, 10]  # Three layers with different hidden sizes
     output_size = 5
     learning_rates = [0.01, 0.005, 0.001]  # Different learning rates for each GRU
+    gamma = 0.99
+    switch_cost = 0.1
+    termination_threshold = 0.9
     steps_per_layer = [5,4,3]
 
     # Create the MetaRL model
-    meta_model = MetaRL(input_size, hidden_sizes, output_size, learning_rates, steps_per_layer)
-...
+    meta_model = MetaRL(input_size, hidden_sizes, output_size, learning_rates, gamma, switch_cost, termination_threshold)
+    # Create a dummy environment
+    env = DummyEnv(input_size)
+    # Example training loop
+    for epoch in range(5):
+        # Generate dummy data
+        x = torch.randn(1, input_size)
+        # Perform meta-learning step
+        loss, reward, effort = meta_model.meta_step(x=x, env=env, layer_idx=meta_model.n_layers - 1, ext=x)
+        print(f"\nEpoch {epoch + 1}")
+        print(f"Total Loss: {loss}")
+        print(f"Total Reward: {reward}")
+        print(f"Total Effort: {effort}")

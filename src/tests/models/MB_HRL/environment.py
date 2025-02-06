@@ -29,7 +29,7 @@ class Environment:
         else:
             raise ValueError("Invalid action")
 
-    def __init__(self, width, height, n_rewards, n_efforts, n_objects): # Added default dimensions and objects
+    def __init__(self, width, height, n_efforts, n_objects): # Added default dimensions and objects
         self.width = width
         self.height = height
         self.n_objects = n_objects
@@ -173,7 +173,6 @@ class Environment:
         return grid, path
 
     def plot_path(self, agent):
-        plt.style.use('rose-pine')
         fig, ax = plt.subplots(figsize=(5, 5))
 
         grid, path = self.create_grid_and_path()
@@ -182,8 +181,9 @@ class Environment:
         critic_values = np.zeros_like(self.rewards)
         for i in range(self.rewards.shape[0]):
             for j in range(self.rewards.shape[1]):
-                state = self._coord_to_sdr(j, i)
-                # critic_values[i, j] = agent.critic.value(state)
+                # state = self._coord_to_sdr(j, i)
+                # critic_values[i, j] = agent.critic.value(state) # Gets the critic value for the state
+                critic_values[i, j] = self.rewards[i, j]
 
         # Plot the grid
         cmap = colors.ListedColormap(['white', 'black', 'red', 'blue', 'green', 'yellow', 'purple', 'cyan'])
@@ -229,10 +229,12 @@ class Environment:
         previous_action_one_hot = self.action_to_one_hot(0) # Initialize with no previous action
         s = np.concatenate([state_one_hot, direction_one_hot, proximity_one_hots.flatten(), previous_action_one_hot])
 
-        return s, self.reward, self.done
+        return s, self.reward, self.effort, self.done
 
     def step(self, action):
         moved = False
+        new_state = self.state
+
         if len(self.path) == 0:
             self.path.append(self.state)
 
@@ -246,7 +248,7 @@ class Environment:
             self.direction = (self.direction + 1) % 4
             self.effort = 1  # Minimum effort for turning
         elif action == Action.MOVE_FORWARD:
-            new_state = self.state
+
             if self.direction == Direction.NORTH:
                 new_state = (max(self.state[0] - 1, 0), self.state[1])
             elif self.direction == Direction.SOUTH:
@@ -255,14 +257,22 @@ class Environment:
                 new_state = (self.state[0], max(self.state[1] - 1, 0))
             elif self.direction == Direction.EAST:
                 new_state = (self.state[0], min(self.state[1] + 1, self.rewards.shape[1] - 1))
-            
-            if new_state != self.state:
-                self.state = new_state
-                moved = True
-                self.effort = max(1, self.efforts[self.state])  # Minimum effort of 1 for movement
-                self.reward = self.rewards[self.state]  # Only get reward if actually moved
         else:
             raise ValueError(f"Invalid action: {action}")
+        
+        # Figure out if the agent moved
+        if new_state != self.state:
+            print(f"Moved to {new_state} from {self.state}")
+            print(f"got reward: {self.rewards[new_state]}")
+
+            self.state = new_state
+            moved = True
+            self.effort = max(1, self.efforts[self.state])  # Minimum effort of 1 for movement
+            self.reward = self.rewards[self.state]  # Only get reward if actually moved
+        else:
+            print(f"No movement. reward: {self.reward}")
+            self.effort = 1
+            self.reward = 0
 
         if moved:
             self.path.append(self.state)

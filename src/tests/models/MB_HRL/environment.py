@@ -243,12 +243,12 @@ class Environment:
 
         if action == Action.TURN_LEFT:
             self.direction = (self.direction - 1) % 4
-            self.effort = 1  # Minimum effort for turning
+            self.effort = 0  # Minimum effort for turning
         elif action == Action.TURN_RIGHT:
             self.direction = (self.direction + 1) % 4
-            self.effort = 1  # Minimum effort for turning
+            self.effort = 0  # Minimum effort for turning
         elif action == Action.MOVE_FORWARD:
-
+            self.effort = 0  # Minimum effort for moving forward
             if self.direction == Direction.NORTH:
                 new_state = (max(self.state[0] - 1, 0), self.state[1])
             elif self.direction == Direction.SOUTH:
@@ -271,7 +271,7 @@ class Environment:
             self.reward = self.rewards[self.state]  # Only get reward if actually moved
         else:
             print(f"No movement. reward: {self.reward}")
-            self.effort = 1
+            self.effort = 0
             self.reward = 0
 
         if moved:

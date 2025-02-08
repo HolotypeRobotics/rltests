@@ -51,7 +51,8 @@ class TDTwoBanditsLearner:
                         self.values_machine1[t] += self.alpha * td_error
 
                         # Update termination probability only for the current machine
-                        value_diff = continue_value - switch_value
+                        # value_diff = continue_value - switch_value
+                        value_diff = switch_value - continue_value
                         self.termination_probs[t] = 1 / (1 + np.exp(value_diff))
                     else:
                         td_error = current_return - self.values_machine1[t]

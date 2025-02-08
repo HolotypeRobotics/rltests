@@ -134,7 +134,7 @@ class OnlineGRU(nn.Module):
         return total_loss.item(), prediction_error.item()
 
 
-    def calculate_termination_target(self, continue_value, switch_value):
+    def calculate_termination_target(self, continue_value, switch_value, prediction_error):
         # Ensure we're working with detached tensors for this calculation
         if isinstance(continue_value, torch.Tensor):
             continue_value = continue_value.detach()
@@ -142,7 +142,7 @@ class OnlineGRU(nn.Module):
             switch_value = switch_value.detach()
             
         # Calculate value difference
-        value_diff = continue_value - switch_value
+        value_diff = switch_value - continue_value
         
         # Convert to tensor if it's not already
         if not isinstance(value_diff, torch.Tensor):
@@ -210,14 +210,17 @@ class MetaRL:
         x = torch.zeros(current_gru.input_size if layer_idx == self.n_layers - 1 else self.grus[layer_idx + 1].hidden_size)
         x[option_idx] = 1
         accumulated_reward = 0
+        num_steps = 0
         with torch.no_grad():
             for t in range(self.num_max_steps):
+                num_steps += 1
                 # The predicted next state is fed back in as the external input, producing imagined states
                 _, predicted_reward, ext, termination_prob, _ = self.feed(x, ext, layer_idx, execute=False)
                 accumulated_reward += ((self.gamma **t) * predicted_reward) # Accumulate reward discounted over time
                 if termination_prob > self.termination_threshold:
                     break
-
+        print(f"Rollout for option {option_idx} in layer {layer_idx} completed in {num_steps}/{self.num_max_steps} steps with reward {accumulated_reward}")
+        input()
         return accumulated_reward
 
     def apply_control_over_options(self, x, option_idx, prediction_errors):
@@ -299,6 +302,10 @@ class MetaRL:
         return out
 
 
+    # Cant consider different ooptions if we are executing
+    # Termination probability should remain high during planning, and go low to trigger execution
+    # Should see behavior like this: https://www.youtube.com/watch?v=JYXfYI6v1pQ
+
     def meta_step(self, x, env, layer_idx, ext):
         """
         Perform the meta-learning step for the specified layer and recursively process lower layers.
@@ -344,11 +351,9 @@ class MetaRL:
             affordances = self.filter_options(output_detached)
             print(f"Available options after filtering: {affordances}")
             
-
             mean_error = 0
             if len(prediction_errors) > 0:
                 mean_error = np.mean(prediction_errors)
-                affordances = affordances * (1 - mean_error)  # Reduce confidence based on errors
 
             # Look at each option, holding the last one in working memory to compare it to the current one
             last_best_sub_option = torch.argmax(affordances)
@@ -359,6 +364,8 @@ class MetaRL:
 
             # Sort options by confidence and iterate
             sorted_indices = torch.argsort(affordances, descending=True)
+
+
             for option_idx in sorted_indices:
                 sub_option_confidence = affordances[option_idx].item()  # Convert to scalar
                 if sub_option_confidence == 0:
@@ -438,16 +445,17 @@ class MetaRL:
             # Update weights for the current layer based on what we observed
 
             # Calculate continue value (value of continuing with the current option)
-            # continue_value = _ - effort + (self.gamma * chosen_option_value * (1 - termination_prob))
-            # continue_value = chosen_option_value * chosen_option_confidence
-            continue_value = (chosen_option_value * chosen_option_confidence) * (1 - mean_error if len(prediction_errors) > 0 else 0)
-            switch_value =  alternative_option_value * alternative_option_confidence
+            net_reward = reward - effort
+            continue_value = net_reward + chosen_option_value * chosen_option_confidence
+            switch_value =  - net_reward - self.switch_cost + (alternative_option_value * alternative_option_confidence)
 
             # Calculate termination target based on whether to continue or switch
-            termination_target = current_gru.calculate_termination_target(continue_value, switch_value)
+            termination_target = current_gru.calculate_termination_target(continue_value, switch_value, mean_error)
+            print(f"Continue value: {continue_value}, Switch value: {switch_value}")
+            print(f"Termination target: {termination_target}")
 
             # Calculate value target (TD target)
-            value_target = (reward - effort + (self.gamma * chosen_option_value * (1 - termination_target)))
+            value_target = (net_reward + (self.gamma * chosen_option_value * (1 - termination_target)))
 
             # Update weights for the current layer
 
@@ -482,7 +490,7 @@ def train_meta_rl(env, meta_rl, num_episodes, batch_size):
             gru.hidden = gru.init_hidden()
 
         total_reward = 0
-        episode_steps = 0
+        total_effort = 0
 
         # Meta-learning step for the top layer (recursively processes lower layers)
         loss, reward, effort, prediction_errors = meta_rl.meta_step(
@@ -492,10 +500,10 @@ def train_meta_rl(env, meta_rl, num_episodes, batch_size):
             ext=ext
         )
         total_reward += reward
-        episode_steps += effort
+        total_effort += effort
 
 
-        print(f"Episode: {episode + 1}, Total Reward: {total_reward}, Steps: {episode_steps}")
+        print(f"Episode: {episode + 1}, Total Reward: {total_reward}, Total Effort {total_effort}, Steps: {len(env.path)}")
         env.plot_path(meta_rl)  # Assuming you want to visualize the path after each episode
 
 # Example Usage
@@ -531,6 +539,6 @@ meta_rl = MetaRL(external_input_size, hidden_sizes, output_size, learning_rates,
                 epsilon_decay=0.99)
 
 # Train the model
-num_episodes = 10
+num_episodes = 20
 batch_size = 1  # You can adjust this if you implement batch updates
 train_meta_rl(env, meta_rl, num_episodes, batch_size)

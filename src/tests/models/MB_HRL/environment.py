@@ -197,9 +197,11 @@ class Environment:
 
         # Plot the path
         path = np.array(path)
-        ax.plot(path[:, 1], path[:, 0], '-o', markersize=10, color='orange')
-        ax.plot(path[0, 1], path[0, 0], 'oy', markersize=12)  # Start position
-        ax.plot(path[-1, 1], path[-1, 0], 'ob', markersize=12)  # End position
+        print(path)
+        if path.size > 0:
+            ax.plot(path[:, 1], path[:, 0], '-o', markersize=10, color='orange')
+            ax.plot(path[0, 1], path[0, 0], 'oy', markersize=12)  # Start position
+            ax.plot(path[-1, 1], path[-1, 0], 'ob', markersize=12)  # End position
 
         # Set the axis limits and remove ticks
         ax.set_xticks(range(self.rewards.shape[1]))

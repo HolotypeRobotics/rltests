@@ -3,27 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from environment import Environment
-# TODO:
-# - Implement attention network functionality to external GRU inputs
-# - Simulate head movements or gaze shifts that correspond to the current focus of mental simulation.
-# - Prediction error should trigger option switching trhough diminishing confidence in the current option
-#   - It should also effect the learning rate, and control by increasing both
 
-# Implement self play until low prediction error is achieved
-# Implement curiosity driven exploration
-
-class AttentionMechanism(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(AttentionMechanism, self).__init__()
-        self.attention_layer = nn.Linear(input_size, hidden_size)
-
-    def forward(self, external_input, hidden_state):
-        # Simple attention: using a linear layer to get attention weights
-        attention_weights = torch.sigmoid(self.attention_layer(external_input)) # Sigmoid for weights between 0 and 1
-        # Apply attention weights to external input
-        attended_input = attention_weights * external_input
-        return attended_input, attention_weights
 
 class OnlineGRU(nn.Module):
     def __init__(self, input_size, external_input_size, hidden_size, has_output_layer=False, output_size=None, learning_rate=0.01, gamma=0.99, switch_cost=0.1, termination_threshold=0.9):
@@ -40,8 +20,8 @@ class OnlineGRU(nn.Module):
         self.output_size = self.hidden_size if output_size is None else output_size
         self.prediction_error_history = []
         self.base_learning_rate = learning_rate
-        self.adaptive_learning_rate = learning_rate
-        self.attention = AttentionMechanism(external_input_size, external_input_size) # Attention mechanism added
+        self.timestep=0
+
         self.previous_reward = 0
 
         # GRU layer
@@ -74,7 +54,6 @@ class OnlineGRU(nn.Module):
         # Accumulated reward and effort
         self.accumulated_reward = 0
         self.accumulated_effort = 0
-        self.recent_predicted_value = 0
 
         # Termination probability
         self.termination_threshold = termination_threshold
@@ -126,6 +105,7 @@ class OnlineGRU(nn.Module):
 
         # Output action only if bottom layer, and we are not planning
         if self.has_output_layer and execute == True:
+            self.timestep+=1
             return self.output_layer(gru_out[-1, 0, :]), value_estimate, state_prediction, termination_prob, termination_logit
         else:
             return gru_out[-1, 0, :], value_estimate, state_prediction,  termination_prob, termination_logit
@@ -171,50 +151,13 @@ class OnlineGRU(nn.Module):
 
         return total_loss.item(), prediction_error.item()
 
-    def calculate_termination_target(self, continue_value, switch_value, current_reward=0.0):
-        """
-        Calculate whether the previous step should have terminated based on current knowledge.
-        High termination target means the previous step was a peak we should have stopped at.
-        
-        Args:
-            continue_value (float/tensor): Current predicted future value
-            switch_value (float/tensor): Current predicted value of switching
-            current_reward (float): Current step's reward (after the decision)
-            prev_reward (float): Previous step's reward (at decision point)
-            
-        Returns:
-            tensor: Termination probability between 0 and 1
-        """
-        # Ensure we're working with tensors
-        if isinstance(continue_value, torch.Tensor):
-            continue_value = continue_value.detach()
-        if isinstance(switch_value, torch.Tensor):
-            switch_value = switch_value.detach()
-        
-        # Convert everything to tensors if they aren't already
-        current_reward = torch.tensor(current_reward, dtype=torch.float32)
-        self.previous_reward = torch.tensor(self.previous_reward, dtype=torch.float32)
-        
-        # Calculate reward drop (how much worse did we get?)
-        reward_drop = self.previous_reward - current_reward
-        
-        # Should have terminated if:
-        # 1. Previous reward was high AND
-        # 2. Current reward or predicted future value is low
-        
-        # Normalize previous reward to 0-1 range
-        prev_reward_score = torch.sigmoid(self.previous_reward * 2)
-        
-        # Compute how "bad" the result of continuing was
-        # High if current reward AND future value are both low
-        future_loss = 1 - torch.sigmoid(current_reward + continue_value)
-        
-        # Combine: High termination if self.previous_reward was good AND continuing was bad
-        termination_score = prev_reward_score * future_loss
-
-        self.previous_reward = current_reward
-        
-        return termination_score
+    def calculate_termination_target(self, continue_value, current_reward=0.0):
+        # 
+        stop_diff = current_reward - self.previous_reward
+        continue_diff = current_reward - continue_value
+        termination_signal = stop_diff - (continue_diff)
+        print(f"Current reward: {current_reward}, continue_value: {continue_value}, term target: {termination_target}")
+        return termination_target
 
 class MetaRL:
     def __init__(self, external_input_size, hidden_sizes, output_size, learning_rates, gamma=0.99, switch_cost=0.1, termination_threshold=0.9, min_activation=0.1, num_max_steps=100, option_value_threshold=0.5, curiosity_weight=0.5, epsilon=0.2, epsilon_decay = 0.99):
@@ -261,19 +204,7 @@ class MetaRL:
 
 
     def high_confidence_positions_kl(self, affordances, delta=0.1, eps=1e-8):
-        """
-        Identifies indices in the affordances tensor whose KL divergence contribution
-        from uniform is greater than delta, returning them in order of descending
-        affordance value.
 
-        Args:
-            affordances (torch.Tensor): 1D tensor of raw confidence scores.
-            delta (float): Minimum margin above uniform needed to call an option high confidence.
-            eps (float): A small number to avoid log(0).
-
-        Returns:
-            torch.Tensor: The indices of options deemed high confidence, sorted by maximum affordance.
-        """
         # Convert to probabilities
         p = F.softmax(affordances, dim=0)
         n = affordances.numel()
@@ -293,49 +224,18 @@ class MetaRL:
 
         return sorted_indices
 
-    def rollout_option(self, ext, layer_idx, option_idx):
-        """
-        Perform a rollout for a single option in the specified layer.
-        This essentially simulates a chain of thought to assertain the value of the option.
-        This is an essential part of planning.
-        """
-        current_gru = self.grus[layer_idx]
-        # Set the option as the 1 hot input, basically temporarilly choosing and holding the option, during the rollout
-        x = torch.zeros(current_gru.input_size if layer_idx == self.n_layers - 1 else self.grus[layer_idx + 1].hidden_size)
-        x[option_idx] = 1
-        accumulated_value = 0
-        num_steps = 0
-        output = torch.zeros(current_gru.output_size)
-        with torch.no_grad():
-            for t in range(self.num_max_steps):
-                num_steps += 1
-                # The predicted next state is fed back in as the external input, producing imagined states
-                output, predicted_value, ext, termination_prob, _ = self.feed(x=x, ext=ext, opt=output, layer_idx=layer_idx, execute=False)# Modified value accumulation: Emphasize termination probability
-                accumulated_value += predicted_value * (self.gamma**t)  # Discounted accumulated value
-                print(f"Rollout step {t}, predicted reward: {predicted_value}, accumulated reward: {accumulated_value}")
-                print(f"Termination probability: {termination_prob}")
-                print(f"State prediction: {ext}")
-                # input()
-                if termination_prob > self.termination_threshold:
-                    print(f"Rollout for option {option_idx} in layer {layer_idx} completed in {num_steps}/{self.num_max_steps} steps with reward {accumulated_value}")
 
-                    break
+    def rollout_option(self, x, ext, opt, layer_idx, steps):
+        total_value = 0
+        for step in range(steps):
+            opt, predicted_value, ext, termination_prob, _ = self.feed(x=x, ext=ext, opt=opt, layer_idx=layer_idx, execute=False)
+            total_value += predicted_value * (self.gamma **step)
 
-        return accumulated_value, ext
+        return total_value, termination_prob
 
     def apply_control_over_options(self, x, option_idx, prediction_errors):
-        """
-        Apply adaptive control over options based on prediction error frequency.
-        
-        Args:
-        x (torch.Tensor): Original option values
-        option_idx (int): Index of the chosen option
-        prediction_errors (list): Recent prediction errors
-        
-        Returns:
-        torch.Tensor: Modified option values with increased control
-        """
-        print(f"Controlled x before: {x}")
+
+        # print(f"Controlled x before: {x}")
         
         # Calculate error-based metrics
         if not prediction_errors:
@@ -353,7 +253,7 @@ class MetaRL:
         trend_factor = max(0, error_trend * 5)
         total_gain = base_gain + trend_factor
         
-        print(f"Mean error: {mean_error:.4f}, Error trend: {error_trend:.4f}, Total gain: {total_gain:.4f}")
+        # print(f"Mean error: {mean_error:.4f}, Error trend: {error_trend:.4f}, Total gain: {total_gain:.4f}")
         
         # --- Error Thresholding ---
         error_threshold = 0.3  # TODO: make this a parameter
@@ -367,7 +267,7 @@ class MetaRL:
         # Apply exponential boost to chosen option based on gain
         boost_factor = torch.exp(torch.tensor(total_gain))
         controlled_x[option_idx] *= boost_factor
-        print(f"Controlled x after boost: {controlled_x}")
+        # print(f"Controlled x after boost: {controlled_x}")
         
         # Calculate suppression factor based on distance from chosen option
         for i in range(len(controlled_x)):
@@ -377,13 +277,13 @@ class MetaRL:
                 distance_factor = 1 / (1 + abs(i - option_idx))
                 controlled_x[i] *= (base_suppression * distance_factor)
         
-        print(f"Controlled x after suppression: {controlled_x}")
+        # print(f"Controlled x after suppression: {controlled_x}")
         
         # Apply softmax with temperature scaling
         temperature = max(0.1, 1 - mean_error)  # Lower temperature = sharper distribution
         controlled_x = F.softmax(controlled_x / temperature, dim=0)
         
-        print(f"Controlled x after temperature-scaled normalization: {controlled_x}")
+        # print(f"Controlled x after temperature-scaled normalization: {controlled_x}")
         
         return controlled_x
     
@@ -416,15 +316,12 @@ class MetaRL:
     # Termination probability should remain high during planning, and go low to trigger execution
 
     def meta_step(self, x, env, layer_idx, ext):
-        """
-        Perform the meta-learning step for the specified layer and recursively process lower layers.
-        """
+
         # Get the current GRU layer
         current_gru = self.grus[layer_idx]
         # Initialize loss, reward, effort
         loss = 0
         total_reward = 0
-        total_effort = 0
         prediction_errors = []
         output = torch.zeros(current_gru.output_size)
 
@@ -432,133 +329,53 @@ class MetaRL:
 
         for step in range(self.num_max_steps):
 
-            state, _, _, done  = env.get_outputs()
-            state = torch.from_numpy(state).float()
+            state, _, done  = env.get_outputs()
 
             # Forward pass for the current layer
             output, option_value_estimate, state_prediction, termination_prob, termination_logit = self.feed(x=x, ext=state, opt=output, layer_idx=layer_idx)
 
-            print(f"\nLayer {layer_idx}, Step {step}")
-            print(f"Option values: {option_value_estimate}")
-            print(f"State prediction: {state_prediction}")  # First 5 values
-            print(f"Actual state: {state}")
-            print(f"Prediction error: {torch.mean(torch.abs(state_prediction - state))}")
-            print(f"Termination probability: {termination_prob}")
-            print(f"Termination logit: {termination_logit}")
-            print(f"Output: {output}")
-            print(f"Epsilon: {self.epsilon}")
-
             # Detach output for option selection to prevent gradient issues
             affordances = output.clone().detach()
 
-            # --- Error-Modulated Termination ---
             mean_error = 0 # set default
             if len(prediction_errors) > 0:
                 mean_error = np.mean(prediction_errors[-self.error_history_length:]) # Get recent errors
 
-            # adaptive_threshold = self.termination_threshold - (mean_error * self.termination_factor) # Decrease termination probability as the mean error increases
-            # if termination_prob > adaptive_threshold:
-
             # Check if we should terminate or take another step in the environment/layer
             if termination_prob > self.termination_threshold:
-                print(f"Terminating at layer {layer_idx}, step {step}, adaptive termination prob: {termination_prob} > {self.termination_threshold}")
+                print(f"Terminating at layer {layer_idx}, state: {state}, termination prob: {termination_prob} > {self.termination_threshold}")
+                print()
 
                 break
 
-            # Get the options based on the confidence of each option
-            affordances_idx = self.high_confidence_positions_kl(affordances)
-            print(f"Top options after filtering: {affordances} pos: {affordances_idx}")
-
-            if len(affordances_idx) == 0:
-                # ...   No known options to choose from
-                # Rollout?
-                print("No options to choose from")
-                affordances_idx = torch.argmax(affordances).unsqueeze(0)
-                print(affordances_idx)
-
-
-            # Look at each option, holding the last one in working memory to compare it to the current one
-            last_best_sub_option = affordances_idx[0]
-            chosen_option_value = option_value_estimate.clone().detach()
-            alternative_option_value = 0.0
-
-            # Sort options by confidence and iterate
-
-            for option_idx in affordances_idx:
-                sub_option_confidence = affordances[option_idx].item()  # Convert to scalar
-                if sub_option_confidence == 0:
-                    break
-
-                # Get the sub-option value for the current option by rolling out the option in the lower layer
-                if layer_idx > 0:
-                    sub_option_value, sub_predicted_ext = self.rollout_option(ext=ext, layer_idx=layer_idx - 1, option_idx=option_idx)
-
-                    # TODO: Check the followeing (termination probabiltiy)
-                    # Get the termination probability of the current layers goal from the terminal state of the lower layer.
-                    with torch.no_grad():
-                        _, _, _, termination_prob, _ = self.feed(x=x, ext=sub_predicted_ext, opt=output, layer_idx=layer_idx)
-                        sub_option_value = sub_option_value * termination_prob 
-
-                else:
-                    sub_option_value = chosen_option_value
-
-                # Compare values
-                if isinstance(sub_option_value, torch.Tensor):
-                    sub_option_value = sub_option_value.detach()
-                if isinstance(chosen_option_value, torch.Tensor):
-                    chosen_option_value = chosen_option_value.detach()
-
-                # If the value is greater than the last best value, then set the option as the best option
-                if self.compare_option_values(next_value=sub_option_value, previous_value=chosen_option_value):
-                    last_best_sub_option = option_idx
-
-                    alternative_option_value = float(chosen_option_value) # setting the value for the alternative option, since we switched, and will have to switch back to regain the value
-
-                    chosen_option_value = float(sub_option_value) # The value for the chosen option
-
-                # Eliminate unused option
-                else:
-                    affordances[option_idx] = 0
+            chosen_option = torch.argmax(affordances)
 
             # Choose the best option
             # set the output to the best option (1-hot)
-            output = self.apply_control_over_options(output, last_best_sub_option, prediction_errors)
+            output = self.apply_control_over_options(output, chosen_option, prediction_errors)
             controlled_output_affordances = output.clone().detach()
-            print(f"Chosen option: {last_best_sub_option}")
-            print(f"Chosen value: {chosen_option_value}")
+            print(f"Layer {layer_idx}, Timestep: {current_gru.timestep} Chosen option: {chosen_option}")
+            # print(f"Chosen value: {chosen_option_value}")
             # Then observe the reward and effort
 
             # Take a step in the environment if we are at the bottom layer
             if layer_idx == 0:
-                # Get action from the output of the bottom layer GRU
-                action_probs = F.softmax(output, dim=0)
-                # Epsilon-greedy action selection
-                if np.random.rand() < self.epsilon:
-                    print("Random action")
-                    action = np.random.choice(len(action_probs))
-                else:
-                    action = torch.argmax(action_probs).item()
-
-                self.epsilon *= self.epsilon_decay  # Decay epsilon
-
-                # Step in the environment
-                _, reward, effort, done = env.step(action)
-                # Update effort based on environment's effort
-                total_effort += effort
+                action = chosen_option
+                _, reward, done = env.step(action)
                 total_reward += reward
 
-                print(f"Action: {env.action_to_string(action)}, Reward: {reward}, Effort: {effort}, total reward: {total_reward}, Done: {done}")
+                print(f"Action: {action}, Reward: {reward}, total reward: {total_reward}, Done: {done}")
+                print(f"State: {state}")
                 # If at the bottom layer and the episode is done, break the inner loop
                 if done:
                     break
             else:
                 # Recursively call meta_step for the lower layer
-                loss_lower, reward, effort, pred_errors_lower = self.meta_step(
+                loss_lower, reward, pred_errors_lower = self.meta_step(
                     x=output, env=env, layer_idx=layer_idx - 1, ext=state
                 )
                 loss += loss_lower
                 total_reward += reward  # Accumulate reward from lower layers
-                total_effort += effort  # Accumulate effort from lower layers
                 prediction_errors.extend(pred_errors_lower)
 
                 # If a lower layer indicates termination, respect that decision
@@ -568,18 +385,17 @@ class MetaRL:
             # Update weights for the current layer based on what we observed
 
             # Calculate continue value (value of continuing with the current option)
-            net_reward = reward - effort
-            continue_value = chosen_option_value
-            switch_value = (alternative_option_value) - self.switch_cost
+            predicted_future_value, predicted_termination_prob = self.rollout_option(x=x, ext=ext, opt=output, layer_idx=layer_idx, steps=1)
+            print(f"predicting value for next state: {predicted_future_value}")
 
             # Calculate termination target based on whether to continue or switch
-            termination_target = current_gru.calculate_termination_target(continue_value, switch_value, reward)
-            print(f"Continue value: {continue_value}, Switch value: {switch_value}")
-            print(f"Termination target: {termination_target}")
+            termination_target = current_gru.calculate_termination_target(continue_value=predicted_future_value, current_reward=reward)
+
+            print(f"New termination target for layer{layer_idx}, timestep {current_gru.timestep}: {termination_target}")
             input()
 
             # Calculate value target (TD target)
-            value_target = (net_reward + (continue_value * (1 - termination_target)))
+            value_target = (reward + (predicted_future_value * (1 - termination_target)))
 
             # Update weights for the current layer
 
@@ -598,8 +414,7 @@ class MetaRL:
             prediction_errors.append(pred_error)
             loss += layer_loss
 
-
-        return loss, total_reward, total_effort, prediction_errors
+        return loss, total_reward, prediction_errors
 
     def compare_option_values(self, next_value, previous_value, alpha=0.8, beta=0.2):
         # Ensure we're working with scalar values
@@ -611,59 +426,41 @@ class MetaRL:
         return (alpha * next_value / (1 + (beta * previous_value))) > self.option_value_threshold
 
 
-def train_meta_rl(env, meta_rl, num_episodes, batch_size):
-    for episode in range(num_episodes):
-        # Reset the environment and get initial state
-        s, reward, effort, done = env.reset()
-        ext = torch.tensor(s, dtype=torch.float32)  # Convert to tensor
+class Environment:
+    def __init__(self, seq):
+        self.sequence = seq
+        self.position = 0
+        self.done = False
+        self.action = 0
 
-        # Initialize hidden states for all GRUs
-        for gru in meta_rl.grus:
-            gru.hidden = gru.init_hidden()
+    def step(self, action):
+        self.action = action
+        return self.get_outputs()
 
-        total_reward = 0
-        total_effort = 0
+    def reset(self):
+        self.position = 0
+        self.done = False
+        self.action = 0
+        return self.get_outputs()
 
-        # Meta-learning step for the top layer (recursively processes lower layers)
-        loss, reward, effort, prediction_errors = meta_rl.meta_step(
-            x=ext,  # Pass 'ext' as input to the top-level GRU
-            env=env,
-            layer_idx=meta_rl.n_layers - 1,
-            ext=ext
-        )
-        total_reward += reward
-        total_effort += effort
+    def get_outputs(self):
+        if self.action == 1:
+            if self.position < self.sequence.shape[0] - 1:
+                self.position +=1
 
+            else:
+                self.done = True
 
-        print(f"Episode: {episode + 1}, Total Reward: {total_reward}, Total Effort {total_effort}, Steps: {len(env.path)}")
-        if episode%10 == 0:
-            env.plot_path(meta_rl)  # Assuming you want to visualize the path after each episode
+        one_hot_position = torch.zeros_like(self.sequence)
+        one_hot_position[self.position] = 1
+        self.action = 0
 
-# Example Usage
-width = 3
-height = 3
-n_rewards = 10
-n_efforts = np.random.rand(height, width)  # Example random efforts
-n_objects = 3
-env = Environment(width, height, n_efforts, n_objects)
-
-# # Set rewards and exit (example)
-# for n in range(n_rewards):
-#     x, y = np.random.randint(0, width), np.random.randint(0, height)
-#     reward = np.random.random()
-#     env.set_reward(x, y, reward)  # Random rewards
-for x in range(width):
-    for y in range(height):
-        env.set_reward(x,y, 0.1)
-
-env.set_reward(0,0,0.0)
-env.set_reward(width - 1, height - 1, 10)  # Reward at the exit
-env.set_exit(width - 1, height - 1)
+        return one_hot_position, self.sequence[self.position],  self.done # state, reward, done
 
 # Define MetaRL parameters
-external_input_size = len(env.get_outputs()[0])
-hidden_sizes = [3, 3]  # Example hidden sizes for two layers
-output_size = 3  # Three possible actions
+external_input_size = 5
+hidden_sizes = [2, 2]  # Example hidden sizes for two layers
+output_size = 2  # 2 possible actions 0 and 1
 learning_rates = [0.02, 0.05]  # Example learning rates
 
 # Create MetaRL model
@@ -677,7 +474,9 @@ meta_rl = MetaRL(external_input_size, hidden_sizes, output_size, learning_rates,
                 epsilon=0.7,
                 epsilon_decay=0.999)
 
-# Train the model
-num_episodes = 100
-batch_size = 1  # You can adjust this if you implement batch updates
-train_meta_rl(env, meta_rl, num_episodes, batch_size)
+
+states = torch.tensor([0.1, 0.2, 10, -1, -1])
+env = Environment(seq=states)
+for i in range(10):
+    state, reward, done = env.reset()
+    meta_rl.meta_step(x=state, env=env, layer_idx=1, ext=state)

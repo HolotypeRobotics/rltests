@@ -11,7 +11,7 @@ class SequenceEnv:
         self.seq_len = len(seq)
         self.max_index = self.seq_len - 1
         self.reset()
-    
+
     def reset(self):
         self.index = 0
         self.done = False
@@ -119,8 +119,8 @@ def train_episode_online(env, model, optimizer, init_energy):
         effort_target = torch.tensor(actual_effort, dtype=torch.float32)
         effort_loss = F.mse_loss(predicted_effort.squeeze(), effort_target)
         
-        loss = policy_loss + term_loss + value_loss + effort_coef * effort_loss
-        
+        loss = policy_loss + term_loss + value_loss + (effort_coef * effort_loss)
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

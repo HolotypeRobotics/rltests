@@ -153,6 +153,7 @@ class VTEAgent(nn.Module):
 
             last_best_UCB_Score,  ... = self.resolve_best_action(state, last_best_UCB_Score, last_best_action, action_uncertainty)
            last_best_
+# use sequential ratio test to find best option
             while action_uncertainty > self.action_uncertainty_threshold:
                 UCB_Score, ... = self.resolve_best_action(state, last_best_UCB_Score, last_best_action, action_uncertainty)
                 if UCB_Score > last_best_UCB_Score:

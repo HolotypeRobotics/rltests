@@ -152,7 +152,7 @@ class VTEAgent(nn.Module):
             # It should keep only the first action probs, predicted state, value, effort, and reward, and they should get updated over the course o deliberation.
 
             last_best_UCB_Score,  ... = self.resolve_best_action(state, last_best_UCB_Score, last_best_action, action_uncertainty)
-           
+           last_best_
             while action_uncertainty > self.action_uncertainty_threshold:
                 UCB_Score, ... = self.resolve_best_action(state, last_best_UCB_Score, last_best_action, action_uncertainty)
                 if UCB_Score > last_best_UCB_Score:

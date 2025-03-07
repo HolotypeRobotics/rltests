@@ -3,10 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import os
-from scipy.stats import norm
-import math
+
 
 # Ensure results directory exists
 os.makedirs('results', exist_ok=True)
@@ -64,33 +65,21 @@ class NeuralVTEAgent(nn.Module):
     def __init__(self, input_dim, hidden_dim=64):
         super(NeuralVTEAgent, self).__init__()
 
-        # Feature extraction (Hippocampal/cortical processing)
-        self.feature_net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
 
         # Policy and value (OFC/vmPFC/Accumbens)
-        self.policy_head = nn.Linear(hidden_dim, 2)  # Action selection (stay=0, move=1)
-        self.value_head = nn.Linear(hidden_dim, 1)   # Expected value
+        self.policy_head = nn.Linear(hidden_dim, 1)  # Action selection (move=1)
         # Termination probability head
         self.term_head = nn.Linear(hidden_dim, 1)
+        self.reward_head = nn.Linear(hidden_dim, 1)
+        self.effort_head = nn.Linear(hidden_dim, 1)
 
 
         # Forward model (Hippocampal-PFC predictive code)
         self.forward_net = nn.Sequential(
-            nn.Linear(hidden_dim + 2, hidden_dim),  # Features + action
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, input_dim),
             nn.ReLU()
         )
-
-        # Prediction heads
-        self.next_state_head = nn.Linear(hidden_dim, input_dim)  # Next state prediction
-        self.reward_head = nn.Linear(hidden_dim, 1)              # Reward prediction
-        self.effort_head = nn.Linear(hidden_dim, 1)              # Effort prediction
 
         # Uncertainty estimation (mPFC/OFC uncertainty tracking)
         self.uncertainty_head = nn.Linear(hidden_dim, 1)
@@ -100,22 +89,10 @@ class NeuralVTEAgent(nn.Module):
         self.uncertainty_factor = nn.Parameter(torch.tensor(0.5))  # Threshold modulation by uncertainty
         self.reward_factor = nn.Parameter(torch.tensor(0.2))       # Threshold modulation by reward
 
-        # Belief state encoding (for information gain)
-        self.belief_head = nn.Linear(hidden_dim, hidden_dim)
-
         # Computational resource allocation
         self.max_computation = 10.0
         self.base_temperature = 0.1  # For softmax-based decision making
 
-    def get_features(self, state):
-        """Extract features from state (analogous to hippocampal encoding)"""
-        return self.feature_net(state)
-
-    def get_policy_value(self, features):
-        """Get policy and value (analogous to striatal evaluation)"""
-        logits = self.policy_head(features)
-        value = self.value_head(features)
-        return logits, value
 
     def get_uncertainty(self, features):
         """Estimate uncertainty (analogous to mPFC confidence)"""
@@ -131,13 +108,9 @@ class NeuralVTEAgent(nn.Module):
         combined_uncertainty = (uncertainty + 0.2 * entropy)
         return combined_uncertainty
 
-    def get_belief(self, features):
-        """Get belief state for information gain calculation"""
-        return F.normalize(self.belief_head(features), p=2, dim=1)
-
     def forward(self, state):
         """Forward pass through model: features, policy, value, uncertainty"""
-        features = self.get_features(state)
+        features = F.relu(self.fc1(state))
         logits, value = self.get_policy_value(features)
         uncertainty = self.get_uncertainty(features)
         term_prob = torch.sigmoid(self.term_head(features)) # Add termination prob output
@@ -317,7 +290,6 @@ class NeuralVTEAgent(nn.Module):
                 # Integrated value (reward + information - effort)
                 branch_value = total_reward + 0.2 * total_info_gain - 0.8 * total_effort
                 branch_uncertainty_val = next_uncertainty.item()
-
                 threshold = self.calculate_threshold(branch_uncertainty_val, total_reward) # Moved threshold calculation here
 
                 # Accumulate evidence for this action

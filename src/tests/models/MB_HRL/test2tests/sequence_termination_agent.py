@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+
 
 class SequenceEnv:
     def __init__(self, seq, topology):
@@ -35,7 +39,7 @@ class SequenceEnv:
             prev_topology = self.topology[self.index]
             self.index += 1
             effort = self.topology[self.index] - prev_topology
-            reward = self.seq[self.index]
+            reward = self.seq[self.index] - self.seq[self.index - 1] - effort
 
         # One-hot encoding of the action to feed as input to the next step.
         self.prev_action = np.eye(2, dtype=np.float32)[action]
@@ -139,8 +143,8 @@ if __name__ == '__main__':
         return np.random.uniform(-10, 10, size=length)
     
     # seq = generate_random_sequence(7)
-    seq = [1, 3, 10, 10, -10, 20, -1]
-    topology = [0, 0, 4, 1, 2, 5, 60]
+    seq = [1, 6, 7, 8]
+    topology = [1, 2, 3, 4, 5]
     print("Reward sequence:", seq)
     print("Topology:", topology)
     

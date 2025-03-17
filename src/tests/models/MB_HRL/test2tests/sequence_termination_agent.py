@@ -4,6 +4,25 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 
+"""
+So far:
+- Agent learns to navigate a sequence of states and terminate at the optimal time.
+- Learns 2 different sequences now instead of just one.
+ * A 1-hot context is given to the agent to say which sequence it is learning.
+- Predicts the 1-hot index of the next position in the sequence.
+- Gives its confidence in the predicted state using temperature scaling confidence calibration.
+ * That way it can learn to predict the next state with a confidence that matches the accuracy of the prediction
+- Added a head to the model for information value prediction
+  * Based on the difference of confidence of the next position prediction instead of actual difference in state information
+- Made the second sequence give different states so that the agent is forced to learn 2 different sequences to associate with the respoective contexts
+
+Todo:
+- Combine voi and value into a decision variable to choose the action. 
+- Task switching based on prediction error.
+- control/habit network interactions
+
+"""
+
 # Multi-sequence environment.
 class MultiSeqEnv:
     def __init__(self, reward_seqs, effort_seqs):

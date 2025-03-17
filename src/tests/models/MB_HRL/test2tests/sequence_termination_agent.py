@@ -1,160 +1,207 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
 
-
-class SequenceEnv:
-    def __init__(self, seq, topology):
-        self.seq = np.array(seq, dtype=np.float32)
-        self.topology = np.array(topology, dtype=np.float32)
-        self.seq_len = len(seq)
-        self.max_index = self.seq_len - 1
-        self.reset()
-
-    def reset(self):
-        self.index = 0
+# Multi-sequence environment.
+class MultiSeqEnv:
+    def __init__(self, reward_seqs, effort_seqs):
+        # reward_seqs and effort_seqs are lists of sequences.
+        assert len(reward_seqs) == len(effort_seqs), "Mismatch in number of sequences"
+        self.reward_seqs = reward_seqs  # e.g., two different sequences.
+        self.effort_seqs = effort_seqs
+        # Assume all sequences have the same length.
+        self.seq_len = len(reward_seqs[0])
+        self.reset(np.array([1, 0], dtype=np.float32))  # default context.
+    
+    def reset(self, context):
+        # context: a one-hot vector of length 2 determining which sequence to use.
+        self.context = context  # store context.
+        self.seq_idx = int(np.argmax(context))  # choose sequence 0 or 1.
+        self.reward_seq = self.reward_seqs[self.seq_idx]
+        self.effort_seq = self.effort_seqs[self.seq_idx]
+        self.pos = 0 if self.seq_idx == 0 else self.seq_len - 1  # Start at opposite ends.
         self.done = False
+
+        # Initial previous action: zero vector (for two possible actions).
         self.prev_action = np.zeros(2, dtype=np.float32)
         return self._get_obs()
     
     def _get_obs(self):
-        pos_onehot = np.zeros(self.seq_len, dtype=np.float32)
-        pos_onehot[self.index] = 1.0
-        obs = np.concatenate([pos_onehot, self.prev_action])
+        # One-hot encoding of current position (length = seq_len).
+        index_onehot = np.zeros(self.seq_len, dtype=np.float32)
+        index_onehot[self.pos] = 1.0
+        # Observation: [position one-hot, previous action (2), context (2)].
+        obs = np.concatenate([index_onehot, self.prev_action, self.context])
         return obs
-
-    def step(self, action, terminate):
+    
+    def step(self, action):
         if self.done:
-            raise RuntimeError("Episode already terminated.")
-        effort = 0.0001
-        reward = 0.0
-
-        # If the agent moves right, it incurs an effort cost (effort), but gets a reward.
-        if action == 1 and self.index < self.max_index:
-            prev_topology = self.topology[self.index]
-            self.index += 1
-            effort = self.topology[self.index] - prev_topology
-            reward = self.seq[self.index] - self.seq[self.index - 1] - effort
-
-        # One-hot encoding of the action to feed as input to the next step.
-        self.prev_action = np.eye(2, dtype=np.float32)[action]
-
-        # If termination is signaled (or the agent reaches the end), the episode ends.
-        if terminate or self.index == self.max_index:
+            raise Exception("Episode terminated. Call reset() to restart.")
+        
+        # Compute net reward at current index.
+        reward = self.reward_seq[self.pos] - self.effort_seq[self.pos]
+        
+        if action == 1:  # Terminate.
             self.done = True
+        else:
+            if self.seq_idx == 0 and self.pos < self.seq_len - 1:  
+                self.pos += 1  # Move forward in sequence 0.
+            elif self.seq_idx == 1 and self.pos > 0:
+                self.pos -= 1  # Move backward in sequence 1.
+            else:
+                self.done = True
+        
+        # Update previous action one-hot.
+        prev_action_onehot = np.zeros(2, dtype=np.float32)
+        prev_action_onehot[action] = 1.0
+        self.prev_action = prev_action_onehot
+        
+        return self._get_obs(), reward, self.done, {}
 
-        # Return the next observation, reward, effort, termination signal, and index.
-        next_obs = self._get_obs() if not self.done else None
-        return next_obs, reward, effort, self.done, self.index
-
-class ActorCriticNet(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, num_actions=2):
-        super(ActorCriticNet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        # Policy (action logits)
-        self.action_head = nn.Linear(hidden_dim, num_actions)
-        # State-value
-        self.value_head = nn.Linear(hidden_dim, 1)
-        # Termination probability
-        self.term_head = nn.Linear(hidden_dim, 1)
-        # Predicted effort for transitioning to the next state.
-        self.effort_head = nn.Linear(hidden_dim, 1)
+# Actor-Critic network with an additional next-position prediction head and temperature scaling.
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, seq_len, hidden_dim=128, action_dim=2):
+        super(ActorCritic, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_actor = nn.Linear(hidden_dim, action_dim)
+        self.fc_critic = nn.Linear(hidden_dim, 1)
+        # Head for next position prediction.
+        self.fc_position = nn.Linear(hidden_dim, seq_len)
+        # Head for information value prediction.
+        self.fc_info_value = nn.Linear(hidden_dim, 1)  # Information gain prediction.
+        # Learnable temperature parameter (log scale for positivity).
+        self.log_temperature = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        action_logits = self.action_head(x)
-        value = self.value_head(x)
-        term_prob = torch.sigmoid(self.term_head(x))
-        # Use softplus to ensure predicted effort is positive.
-        predicted_effort = F.softplus(self.effort_head(x))
-        return action_logits, value, term_prob, predicted_effort
+        logits = self.fc_actor(x)
+        value = self.fc_critic(x)
+        next_pos_logits = self.fc_position(x)
+        info_value = self.fc_info_value(x).squeeze(-1)  # Scalar output.
 
-def train_episode_online(env, model, optimizer, init_energy):
-    obs = env.reset()
-    obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-    total_reward = 0.0
-    done = False
-    # Initialize energy and timestep counter.
-    energy = init_energy
-    timestep = 1
-    effort_coef = 1.0
-    
-    while not done:
-        action_logits, value, term_prob, predicted_effort = model(obs)
-        action_dist = torch.distributions.Categorical(logits=action_logits)
-        action = action_dist.sample()
-        log_prob = action_dist.log_prob(action)
-        
-        term_dist = torch.distributions.Bernoulli(term_prob)
-        term_sample = term_dist.sample()
-        term_log_prob = term_dist.log_prob(term_sample)
-        terminate = term_sample.item() > 0.5
-        
-        obs_next, reward, actual_effort, done, index = env.step(action.item(), terminate)
-        total_reward += reward
-        
-        # Compute next state's value if not terminal.
-        if not done:
-            next_obs = torch.tensor(obs_next, dtype=torch.float32).unsqueeze(0)
-            _, next_value, _, _ = model(next_obs)
-            next_value = next_value.squeeze().detach()
-        else:
-            next_value = torch.tensor(0.0)
-        
-        # One-step TD target and error.
-        # Don't do this: timestep += 1, because we are using one-step TD targets.
-        discount = torch.exp(-predicted_effort.squeeze() / energy)
-        td_target = reward + discount * next_value
-        delta = td_target - value.squeeze()
-        
-        # Use the TD error as the advantage for both policy and termination.
-        policy_loss = -log_prob * delta.detach()
-        term_loss = -term_log_prob * delta.detach()
-        value_loss = F.mse_loss(value.squeeze(), td_target.detach())
-        
-        # Effort prediction loss: match predicted effort to actual effort experienced.
-        effort_target = torch.tensor(actual_effort, dtype=torch.float32)
-        effort_loss = F.mse_loss(predicted_effort.squeeze(), effort_target)
-        
-        loss = policy_loss + term_loss + value_loss + (effort_coef * effort_loss)
+        # Temperature scaling for calibration.
+        temperature = torch.exp(self.log_temperature)  # Ensure temperature > 0.
+        calibrated_logits = next_pos_logits / temperature
+        # Confidence is computed as the maximum probability from the calibrated logits.
+        confidence = F.softmax(calibrated_logits, dim=-1).max(dim=-1)[0]
+        return logits, value, next_pos_logits, calibrated_logits, confidence, info_value
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # Update energy: energy is decreased by effort and replenished (or further drained) by the reward.
-        energy = max(energy - actual_effort + reward, 0.1)
-        
-        
-        if not done:
-            obs = torch.tensor(obs_next, dtype=torch.float32).unsqueeze(0)
+def train_online_multi_sequence():
+    # Define two sequences.
+    # Sequence 0:
+    reward_seq0 = [1.0, 2.0, 3.0, 4.0, 3.5, 3.0, 2.5, 2.0]
+    effort_seq0 = [0.5, 0.5, 0.5, 1.0, 11.0, 1.0, 10.0, 1.0]
+    # Sequence 1: Slightly different reward/effort profiles.
+    reward_seq1 = [0.5, 1.5, 2.5, 3.5, 3.0, 2.5, 2.0, 1.5]
+    effort_seq1 = [0.2, 0.3, 5.5, 1.1, 3.9, 20, 1.0, 1.0]
     
-    return total_reward, index
-
-if __name__ == '__main__':
-    def generate_random_sequence(length=7):
-        return np.random.uniform(-10, 10, size=length)
+    env = MultiSeqEnv([reward_seq0, reward_seq1], [effort_seq0, effort_seq1])
+    seq_len = env.seq_len
+    # State consists of: one-hot position (seq_len) + previous action (2) + context (2).
+    state_dim = seq_len + 2 + 2  
+    action_dim = 2  # 0: move forward, 1: terminate.
     
-    # seq = generate_random_sequence(7)
-    seq = [1, 6, 7, 8]
-    topology = [1, 2, 3, 4, 5]
-    print("Reward sequence:", seq)
-    print("Topology:", topology)
-    
-    env = SequenceEnv(seq, topology)
-    input_dim = env.seq_len + 2   # one-hot for position and previous action.
-    model = ActorCriticNet(input_dim)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    model = ActorCritic(state_dim, seq_len)
+    optimizer = optim.Adam(model.parameters(), lr=1e-2)
     
     num_episodes = 1000
+    gamma = 0.99
+    pos_loss_weight = 1.0  # Weight for next-position prediction loss.
+    info_loss_weight = 0.5  # Weight for information value loss.
+    
+    # Alternate between the two contexts.
+    contexts = [np.array([1, 0], dtype=np.float32), np.array([0, 1], dtype=np.float32)]
+    
     for episode in range(num_episodes):
-        total_reward, index = train_episode_online(env, model, optimizer, init_energy=10.0)
-        if episode % 100 == 0:
-            print(f"Episode {episode}, Total Reward: {total_reward:.2f}, Index: {index}")
+        context = contexts[episode % 2]
+        state = env.reset(context)
+        total_reward = 0.0
+        total_pos_loss = 0.0
+        done = False
+        prev_confidence = None  # Track previous confidence for info gain calculation.
+
+        while not done:
+            state_tensor = torch.FloatTensor(state).unsqueeze(0)  # Shape: (1, state_dim)
+            logits, value, next_pos_logits, calibrated_logits, confidence, info_value = model(state_tensor)
+            probs = F.softmax(logits, dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+            
+            next_state, reward, done, _ = env.step(action.item())
+            total_reward += reward
+            
+            # Bootstrapping for value of next state.
+            if not done:
+                next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0)
+                _, next_value, _, _, next_confidence, _ = model(next_state_tensor)
+            else:
+                next_value = torch.zeros(1)
+                next_confidence = torch.tensor(0.0)  # No confidence on termination.
+            
+            # One-step TD error (advantage).
+            advantage = reward + gamma * next_value - value
+            
+            # Actor (policy) and critic (value) losses.
+            policy_loss = -log_prob * advantage.detach()
+            value_loss = advantage.pow(2)
+
+            # Next position prediction loss: using calibrated logits.
+            if not done:
+                # # Target is the index corresponding to the next position.
+                # target_index = np.argmax(next_state[:seq_len])
+                # target_index = torch.tensor([target_index])
+                # pos_loss = F.cross_entropy(calibrated_logits, target_index)
+
+                # Target is the index corresponding to the next position
+                target_index = np.argmax(next_state[:seq_len])
+                target_index = torch.tensor([target_index])
+                
+                # Basic prediction loss (using uncalibrated logits)
+                pos_loss = F.cross_entropy(next_pos_logits, target_index)
+                
+                # Additional calibration loss
+                # This optimizes the temperature parameter to match confidence with accuracy
+                pred_index = torch.argmax(next_pos_logits, dim=1)
+                # We could alternatively use the difference in distrobutions
+                correct = (pred_index == target_index).float()
+                calibration_loss = F.binary_cross_entropy(confidence, correct)
+                
+                pos_loss_total = pos_loss + calibration_loss
+            else:
+                pos_loss_total = 0.0
+
+            # Information gain prediction loss.
+            if prev_confidence is not None:
+                info_gain_actual = next_confidence - prev_confidence
+            else:
+                info_gain_actual = torch.tensor(0.0)
+
+            info_gain_loss = F.mse_loss(info_value, info_gain_actual)
+
+            prev_confidence = confidence.detach()  # Update confidence for next step.
+            
+            total_pos_loss += pos_loss_total
+            loss = policy_loss + value_loss + pos_loss_weight * pos_loss_total + info_loss_weight * info_gain_loss
+            # loss = policy_loss + value_loss + pos_loss + calibration_loss
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # (Optional) Print the confidence for this step if desired.
+            # input(f"Step confidence: {confidence.item()}, Info gain loss: {info_gain_loss}, Info gain actual: {info_gain_actual.item()}")
+
+            
+            state = next_state
+        
+        if (episode+1) % 100 == 0:
+            print(f"Episode {episode+1}, Context 1 Total Reward: {total_reward:.2f},  Terminated at: {env.pos}, Prediction Loss: {total_pos_loss:.4f}, Confidence: {confidence.item()}")
+
+        elif episode % 100 == 0:
+            print(f"Episode {episode+1}, Context 2 Total Reward: {total_reward:.2f},  Terminated at: {env.pos}, Prediction Loss: {total_pos_loss:.4f}, Confidence: {confidence.item()}")
+      
+if __name__ == "__main__":
+    train_online_multi_sequence()

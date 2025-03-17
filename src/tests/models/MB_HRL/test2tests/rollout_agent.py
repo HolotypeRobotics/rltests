@@ -21,30 +21,44 @@ class SequenceEnv:
         self.done = False
         self.prev_action = np.zeros(2, dtype=np.float32)
         return self._get_obs()
-    
+
     def _get_obs(self):
         pos_onehot = np.zeros(self.seq_len, dtype=np.float32)
         pos_onehot[self.index] = 1.0
         obs = np.concatenate([pos_onehot, self.prev_action])
         return obs
 
-    def step(self, action, terminate):
+    def step(self, action):
+        """
+        Take a step in the environment. Actions:
+        0: terminate, reward = 0, effort = 0
+        1: move forward
+        """
         if self.done:
             raise RuntimeError("Episode already terminated.")
+        
         effort = 0.0001
         reward = 0.0
+        
+        terminate = (action == 0)
+        
+        # If the agent moves right (action 1), update position
         if action == 1 and self.index < self.max_index:
             prev_topology = self.topology[self.index]
             prev_reward = self.seq[self.index]
             self.index += 1
             effort = self.topology[self.index] - prev_topology
             reward = self.seq[self.index] - prev_reward
+        
+        # Record the action
         self.prev_action = np.eye(2, dtype=np.float32)[action]
+        
+        # Check if episode should terminate
         if terminate or self.index == self.max_index:
             self.done = True
+        
         next_obs = self._get_obs() if not self.done else None
         return next_obs, reward, effort, self.done, self.index
-
 
 class ActorCriticNet(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, num_actions=2):
@@ -64,10 +78,8 @@ class ActorCriticNet(nn.Module):
         
         # Additional network for belief state representation
         self.belief_output = nn.Linear(hidden_dim, input_dim)
-        
-        # Confidence head - measures confidence in current action vs alternatives
-        self.conf_head = nn.Linear(hidden_dim, 1)
-        
+
+
     def forward(self, x):
         x = F.relu(self.fc1(x))
         features = F.relu(self.fc2(x))
@@ -81,7 +93,6 @@ class ActorCriticNet(nn.Module):
         belief = self.belief_output(belief)
         
         return action_logits, value, term_prob, predicted_effort, exec_prob, belief
-
 
 def kl_divergence(p, q):
     """
@@ -112,7 +123,7 @@ def simulate_internal_rollout(model, forward_model, obs, max_depth=5, discount=0
     current_obs = obs.clone()
     
     # Get initial predictions from policy
-    action_logits, initial_value, _, _, initial_exec_prob, initial_confidence, initial_features = model(current_obs)
+    action_logits, initial_value, _, _, initial_exec_prob, initial_belief = model(current_obs)
     action_probs = F.softmax(action_logits, dim=1)
     
     # Initial belief state about the environment (used for information gain)
@@ -418,12 +429,6 @@ def train_episode(env, model, optimizer, init_energy=10.0,
             exec_target = exec_target * (1.0 - min(0.8, current_smoothed_error))
         exec_loss = F.binary_cross_entropy(exec_prob.view(-1), exec_target)
         
-        # Train confidence head - higher when action was beneficial AND prediction was accurate
-        conf_target = torch.sigmoid(torch.tensor([reward + 0.5]))
-        if current_smoothed_error > 0:
-            # Reduce confidence when prediction errors are high
-            conf_target = conf_target * (1.0 - min(0.8, current_smoothed_error))
-        conf_loss = F.binary_cross_entropy(confidence.view(-1), conf_target)
         
         # Forward model loss with L2 regularization
         if not done:
@@ -444,7 +449,7 @@ def train_episode(env, model, optimizer, init_energy=10.0,
         
         # Total loss
         loss = (policy_loss + 0.5 * term_loss + value_loss + effort_coef * effort_loss + 
-                0.5 * exec_loss + 0.5 * conf_loss + entropy_loss + forward_coef * forward_total_loss)
+                0.5 * exec_loss + entropy_loss + forward_coef * forward_total_loss)
         
         total_loss += loss.item()
         

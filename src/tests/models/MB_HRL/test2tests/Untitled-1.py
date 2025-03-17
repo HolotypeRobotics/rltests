@@ -36,7 +36,7 @@ class SequenceEnv:
     def step(self, action):
         """
         Take a step in the environment. Actions:
-        0: terminate
+        0: terminate, reward = 0, effort = 0
         1: move forward
         """
         if self.done:
@@ -83,6 +83,7 @@ class VTEAgent(nn.Module):
         self.effort_head = nn.Linear(hidden_dim, 1)
         self.reward_head = nn.Linear(hidden_dim, 1)
         self.value_head = nn.Linear(hidden_dim, 1)
+        self.information_gain_head = nn.Linear(hidden_dim, 1)
         
         # Prediction heads (predict next state, reward from current state and action)
         self.predict_next_state = nn.Linear(hidden_dim , input_dim)  # Hidden + one-hot action
@@ -97,37 +98,43 @@ class VTEAgent(nn.Module):
         x = F.relu(self.fc2(x))
         return x
     
-    def forward(self, x):
+    def forward(self, x, previous_action):
         """Forward pass: policy, value, and uncertainty"""
+        x = torch.cat([x, previous_action], dim=1)
         hidden = self.get_hidden_features(x)
-        
         action_logits = self.action_head(hidden)
-        predicted_reward = self.reward_head(hidden)
-        predicted_effort = F.softplus(self.effort_head(hidden))
         predicted_state = self.predict_next_state(hidden)
         predicted_value = self.value_head(hidden)
         
-        return action_logits, predicted_reward, predicted_effort, predicted_value, predicted_state, hidden
+        return action_logits, predicted_value, predicted_state, hidden
 
 
-    def resolve_best_action(self, state, ):
-        action_logits, predicted_reward, predicted_effort, predicted_value, predicted_state_in_branch, hidden_features = self.forward(state)
+    def branch(self, root_state, root_action, t, last_best_UCB_Score, branch_UCB_Score):
+        with torch.no_grad():
+            action_logits, predicted_value, predicted_state_in_branch, _ = self.forward(root_state, root_action)
+            
+            # Get action probabilities
+            action_probs = F.softmax(action_logits, dim=1)
+
+            # Calculate uncertainty in imagined state prediction
+            # This calculation may be wrong
+            state_uncertainty = -torch.sum(predicted_state_in_branch * torch.log(predicted_state_in_branch + 1e-8)).item()
+
+            # Calculate uncertainty in imagined actions
+            action_uncertainty = -torch.sum(action_probs * torch.log(action_probs + 1e-8), dim=1).item()
+
+            discounted_value = predicted_value * (self.gamma ** t)
         
-        # Get action probabilities
-        action_probs = F.softmax(action_logits, dim=1)
+            #TODO Use Upper Confidence Bound and determine if this branch is still worth exploring
+            #would it be like branch_UCB_Score += confidence * discounted_value? or something else?
 
-        # Calculate uncertainty in imagined state prediction
-        # This calculation may be wrong
-        state_uncertainty = -torch.sum(predicted_state_in_branch * torch.log(predicted_state_in_branch + 1e-8)).item()
+            if discounted_value < self.diminishing_returns_threshold:
+                return branch_UCB_Score
 
-        # Calculate uncertainty in imagined actions
-        action_uncertainty = -torch.sum(action_probs * torch.log(action_probs + 1e-8), dim=1).item()
-    
-        # Use Upper Confidence Bound (UCB) to select action
-        UCB_Score = predicted_value + 
-        if last_best_UCB_Score is None or UCB_Score > last_best_UCB_Score:
-            last_best_UCB_Score = UCB_Score
-            last_best_action = action_probs
+            # If it is, then recursively call this function with the new state and action
+            return self.branch(predicted_state_in_branch, action_probs, t+1, last_best_UCB_Score, branch_UCB_Score)
+
+
     
     def vte_rollout(self, state, max_depth=3, discount=0.95):
         """
@@ -145,10 +152,9 @@ class VTEAgent(nn.Module):
             last_best_UCB_Score = None
             action_uncertainty = 1.0
             last_best_value = None
-            last_best_effort = None
-            last_best_reward = None
             
             # Todo: Somehow implement branching.
+            # Maybe use a recursive function that calls itself with the next state and action
             # It should keep only the first action probs, predicted state, value, effort, and reward, and they should get updated over the course o deliberation.
 
             last_best_UCB_Score,  ... = self.resolve_best_action(state, last_best_UCB_Score, last_best_action, action_uncertainty)
@@ -161,10 +167,9 @@ class VTEAgent(nn.Module):
                     last_best_action = action_probs
                     last_best_state = predicted_state_in_branch
                     last_best_value = predicted_value
-                    last_best_effort = predicted_effort
-                    last_best_reward = predicted_reward
 
-            return last_best_action, predicted_reward, predicted_effort, predicted_state_in_branch, hidden_features
+
+            return last_best_action, predicted_state_in_branch, hidden_features
             
 
 

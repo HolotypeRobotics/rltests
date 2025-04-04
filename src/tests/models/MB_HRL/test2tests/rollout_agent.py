@@ -106,13 +106,6 @@ def kl_divergence(p, q):
     return F.kl_div(q_normalized.log(), p_normalized, reduction='batchmean')
 
 
-def calculate_belief_kl(new_belief, old_belief):
-    """
-    Calculate information gain as KL divergence between beliefs
-    This simulates the "expected information gain" from the papers
-    """
-    return kl_divergence(new_belief, old_belief).item()
-
 
 def simulate_internal_rollout(model, forward_model, obs, max_depth=5, discount=0.95, evidence_threshold=0.7):
     """

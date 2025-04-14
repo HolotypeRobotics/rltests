@@ -580,7 +580,6 @@ class Environment:
 
         one_hot_position = torch.zeros_like(self.sequence)
         one_hot_position[self.position] = 1
-        self.action = 0
 
         return one_hot_position, self.sequence[self.position - 1],  self.done # state, reward, done
 

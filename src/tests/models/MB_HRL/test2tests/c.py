@@ -115,7 +115,7 @@ class Agent(nn.Module):
                 # Simulate forward prediction.
                 _, sim_value, _, _, _, sim_confidence, sim_info_value = self.forward(position=position, direction=direction, obj_distances=obj_distances, prev_option=candidate, belief=belief)
                 # TODO: try out different ways of combining the values
-                score = (sim_value + sim_info_value) * sim_confidence
+                score = (sim_value + sim_info_value)
                 if score > best_score:
                     best_score = score
                     best_action = option
@@ -125,16 +125,16 @@ def train_hierarchical():
     # Define a single sequence.
 
     n_objects = 3
-    env = Environment(rewards=[[0, 0, 0, .1, 1],
-                            [0, 0, .1, .1, 0],
-                            [0, .1, .1, 0, 0],
-                            [0, .1, 0, .1, 0],
-                            [0, 0, 0, 0, 1]],
-                    efforts=[[.2, .1, .2, .1, .1],
+    env = Environment(rewards=[[-1, 0.1, 0, .1, 1],
+                            [0, 0.1, .2, .2, 0],
+                            [.05, .1, .5, 0, -1],
+                            [0, .1, 0, .6, 0],
+                            [0, 0, 0, 0, 2]],
+                    efforts=[[.5, .1, .2, .1, .1],
+                            [.1, .1, .1, .5, .1],
+                            [.1, .5, .2, .1, .1],
                             [.1, .1, .1, .1, .1],
-                            [.1, .1, .2, .1, .1],
-                            [.1, .1, .1, .1, .1],
-                            [2, 1, 2, 1, 3]],
+                            [2, 1, 2, 1, 0]],
                     n_objects=n_objects)
 
     # External state: one-hot position (seq_len) + previous action (3) + head direction (2).
@@ -216,12 +216,12 @@ def train_hierarchical():
                     next_low_value = torch.zeros(1)
 
                 # Find low level targets
-                low_pred_pos = torch.argmax(low_pos_logits, dim=1)
-                low_pred_dir = torch.argmax(low_dir_logits, dim=1)
-                low_pred_obj_dist = F.softmax(low_obj_dist_logits)
+                low_pred_pos = torch.argmax(low_pos_logits, dim=-1)
+                low_pred_dir = torch.argmax(low_dir_logits, dim=-1)
+                low_pred_obj_dist = F.softmax(low_obj_dist_logits, dim=-1)
 
-                low_pos_target = torch.argmax(position, dim=1)
-                low_dir_target = torch.argmax(direction, dim=1)
+                low_pos_target = torch.argmax(position, dim=-1)
+                low_dir_target = torch.argmax(direction, dim=-1)
                 low_value_target = reward + gamma * next_low_value.detach()
                 
                 pos_correct = (low_pred_pos == low_pos_target).float()
@@ -276,12 +276,12 @@ def train_hierarchical():
             
 
             # Find high level targets
-            high_pred_pos = torch.argmax(high_pos_logits, dim=1)
-            high_pred_dir = torch.argmax(high_dir_logits, dim=1)
-            high_pred_obj_dist = F.softmax(high_obj_dist_logits)
+            high_pred_pos = torch.argmax(high_pos_logits, dim=-1)
+            high_pred_dir = torch.argmax(high_dir_logits, dim=-1)
+            high_pred_obj_dist = F.softmax(high_obj_dist_logits, dim=-1)
 
-            high_pos_target = torch.argmax(position, dim=1)
-            high_dir_target = torch.argmax(direction, dim=1)
+            high_pos_target = torch.argmax(position, dim=-1)
+            high_dir_target = torch.argmax(direction, dim=-1)
             high_value_target = reward + gamma * next_high_value.detach()
 
             high_pos_correct = (high_pred_pos == high_pos_target).float()

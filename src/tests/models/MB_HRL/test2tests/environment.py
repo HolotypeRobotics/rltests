@@ -18,6 +18,16 @@ class Direction:
     SOUTH = 2
     WEST = 3
 
+# ANSI color codes
+COLORS = {
+    1: '\033[31m',  # Red
+    2: '\033[32m',  # Green
+    3: '\033[34m',  # Blue
+    4: '\033[33m',  # Yellow
+    5: '\033[35m'   # Magenta
+}
+RESET = '\033[0m'  # Reset color
+
 class Environment:
     def action_to_string(self, action):
         if action == Action.TURN_LEFT:
@@ -161,7 +171,56 @@ class Environment:
         return distances
 
     def render(self):
-        print(self.state_to_matrix())
+        # Create a matrix for just the visual characters
+        mat = np.full(self.rewards.shape, ' ', dtype=str)
+        
+        # Track object types in a separate matrix for coloring later
+        obj_types = np.full(self.rewards.shape, 0, dtype=int)
+        
+        # Fill in objects
+        object_positions = self.find_object_positions()
+        for obj_id, pos in object_positions.items():
+            mat[pos[0], pos[1]] = '●'
+            obj_types[pos[0], pos[1]] = obj_id
+        
+        # Place agent on top
+        if self.direction == Direction.NORTH:
+            sprite = '▲'
+        elif self.direction == Direction.SOUTH:
+            sprite = '▼'
+        elif self.direction == Direction.WEST:
+            sprite = '◀'
+        elif self.direction == Direction.EAST:
+            sprite = '▶'
+        
+        agent_row, agent_col = self.state
+        mat[agent_row, agent_col] = sprite
+        obj_types[agent_row, agent_col] = -1  # Special code for agent
+        
+        # Calculate width based on visual characters only
+        width = 2 * mat.shape[1] + 1
+        
+        # Render with fixed-width borders
+        print('┌' + '─' * width + '┐')
+        for i in range(mat.shape[0]):
+            line = '│ '
+            for j in range(mat.shape[1]):
+                # Apply color based on object type
+                obj_id = obj_types[i, j]
+                char = mat[i, j]
+                
+                if obj_id == -1:  # Agent
+                    line += f'\033[36m{char}\033[0m '  # Cyan for agent
+                elif obj_id > 0:  # Object with color
+                    line += f'{COLORS[obj_id]}{char}{RESET} '
+                else:  # Empty space
+                    line += f'{char} '
+            
+            line += '│'
+            print(line)
+        
+        print('└' + '─' * width + '┘')
+
 
     def create_grid_and_path(self):
         grid = np.zeros_like(self.rewards, dtype=int)
@@ -240,6 +299,8 @@ class Environment:
         moved = False
         self.previous_action = action
         new_state = self.state
+        self.effort = 0.0001
+        self.reward = 0
 
         if len(self.path) == 0:
             self.path.append(self.state)
@@ -249,12 +310,13 @@ class Environment:
 
         if action == Action.TURN_LEFT:
             self.direction = (self.direction - 1) % 4
-            self.effort = 0  # Minimum effort for turning
+            self.effort += 0.0012
         elif action == Action.TURN_RIGHT:
             self.direction = (self.direction + 1) % 4
-            self.effort = 0  # Minimum effort for turning
+            self.effort += 0.0012
         elif action == Action.MOVE_FORWARD:
-            self.effort = 0  # Minimum effort for moving forward
+            self.effort += 0.001
+
             if self.direction == Direction.NORTH:
                 new_state = (max(self.state[0] - 1, 0), self.state[1])
             elif self.direction == Direction.SOUTH:
@@ -268,20 +330,17 @@ class Environment:
         
         # Figure out if the agent moved
         if new_state != self.state:
-            print(f"Moved from {self.state} to {new_state}")
-            self.reward = self.rewards[new_state] - self.reward
-            self.effort = self.efforts[new_state] - self.effort
-            self.reward -= self.effort
-            self.state = new_state
             moved = True
-
-        else:
-            print(f"No movement")
-            self.effort = 0
-            self.reward = 0
-
-        if moved:
             self.path.append(self.state)
+
+        self.reward += self.rewards[new_state] - self.rewards[self.state]
+        self.effort += self.efforts[new_state] - self.efforts[self.state]
+        self.reward -= self.effort
+        self.state = new_state
+
+        print()
+        self.render()
+        print(f"Reward: {self.reward}")
         
         return self.get_outputs()
         

@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from environment import Environment
-
+import time
 
 class Agent(nn.Module):
     def __init__(self, input_dim, pos_pred_dim, hidden_dim=128, action_dim=3, head_dir_dim=2, obj_distance_dim=3):
@@ -119,29 +119,26 @@ class Agent(nn.Module):
                 if score > best_score:
                     best_score = score
                     best_action = option
+
+                print(f"Option: {best_action}?")
             return best_action
 
 def train_hierarchical():
     # Define a single sequence.
 
     n_objects = 3
-    env = Environment(rewards=[[-1, 0.1, 0, .1, 1],
-                            [0, 0.1, .2, .2, 0],
-                            [.05, .1, .5, 0, -1],
-                            [0, .1, 0, .6, 0],
-                            [0, 0, 0, 0, 2]],
-                    efforts=[[.5, .1, .2, .1, .1],
-                            [.1, .1, .1, .5, .1],
-                            [.1, .5, .2, .1, .1],
-                            [.1, .1, .1, .1, .1],
-                            [2, 1, 2, 1, 0]],
+    env = Environment(rewards=[[2, 0.1, 0, .1, -3]],
+                    efforts=[[.5, .1, .2, .1, .1]],
                     n_objects=n_objects)
 
     # External state: one-hot position (seq_len) + previous action (3) + head direction (2).
     belief_dim = 2   # For high-level belief.
     action_dim = 3   # left right forward
     head_dir_dim = 4
-    env.set_exit(env.width, env.height)
+    env.set_start((env.width//2), (env.height//2)) # Start in the middle of the grid.
+    print(f"Env start: {env.start}")
+    env.set_exit(env.width-1, env.height-1)
+    print(f"Env exit: {env.exit}")
     pos_dim = env.width * env.height
 
     # High-level agent: input is external state concatenated with belief.
@@ -150,8 +147,8 @@ def train_hierarchical():
     high_agent = Agent(input_dim=high_input_dim, pos_pred_dim=pos_dim, hidden_dim=128, obj_distance_dim=n_objects, action_dim=belief_dim, head_dir_dim=head_dir_dim)
     low_agent = Agent(input_dim=low_input_dim, pos_pred_dim=pos_dim, hidden_dim=128, obj_distance_dim=n_objects, action_dim=action_dim, head_dir_dim=head_dir_dim)
 
-    high_optimizer = optim.Adam(high_agent.parameters(), lr=1e-2)
-    low_optimizer = optim.Adam(low_agent.parameters(), lr=1e-2)
+    high_optimizer = optim.Adam(high_agent.parameters(), lr=1e-3)
+    low_optimizer = optim.Adam(low_agent.parameters(), lr=1e-3)
 
     num_episodes = 1000
     gamma = 0.99
@@ -162,6 +159,7 @@ def train_hierarchical():
     episode_positions = []
     # Define two fixed head directions for training both forward and reverse predictions.
     for episode in range(num_episodes):
+        time.sleep(2)
         (position, direction, obj_distances, prev_action), _, _ = env.reset()
         vte_freq = 0
         belief = torch.zeros(1, belief_dim)
@@ -172,10 +170,12 @@ def train_hierarchical():
 
         # Outer loop: entire episode.
         while not episode_done:
+            time.sleep(1)
             # ----- High-Level: Produce a new belief -----
             high_logits, high_value, high_pos_logits, high_dir_logits, high_obj_dist_logits, high_conf, high_voi = high_agent(position=position, direction=direction, obj_distances=obj_distances, prev_option=belief)
             # Use VTE only if high_conf is low.
             if high_conf.item() < high_agent.conf_threshold:
+                print(f"High VTE...")
                 chosen_high_action = high_agent.VTE(position=position, direction=direction, obj_distances=obj_distances, prev_option=belief, top_k=2, belief=None)
                 vte_freq += 1
             else:
@@ -196,10 +196,12 @@ def train_hierarchical():
                 low_probs = F.softmax(low_logits, dim=-1)
 
                 if low_conf.item() < low_agent.conf_threshold:
+                    print(f"Low VTE...")
                     chosen_action = low_agent.VTE(position=position, prev_option=prev_action, obj_distances=obj_distances, direction=direction, top_k=2, belief=belief)
                     vte_freq += 1
                 else:
                     chosen_action = torch.distributions.Categorical(low_probs).sample()
+                print(f"Belief: {belief}, High conf: {high_conf.item():.3f}, Low Conf: {low_conf.item():.3f},")
 
                 (position, direction, obj_distances, prev_action), reward, env_terminate = env.step(chosen_action.item())
                 segment_reward += reward

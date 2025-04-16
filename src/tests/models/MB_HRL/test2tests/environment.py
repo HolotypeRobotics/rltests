@@ -49,6 +49,7 @@ class Environment:
         self.state = (0, 0)
         self.previous_action = Action.MOVE_FORWARD
         self.direction = Direction.EAST
+        self.start = (0, 0)
         self.exit = (self.height - 1, self.width - 1) # Bottom-right corner
         self.place_objects() # Place objects randomly
         self.object_positions = self.find_object_positions()
@@ -134,7 +135,7 @@ class Environment:
         return one_hot
 
     def reset(self):
-        self.state = (0, 0)
+        self.state = self.start
         self.direction = Direction.EAST
         self.reward = 0  # No reward on reset
         self.effort = 0
@@ -147,6 +148,9 @@ class Environment:
 
     def set_reward(self, x, y, reward):
         self.rewards[y, x] = reward
+
+    def set_start(self, x, y):
+        self.start = (y, x)
 
     def set_exit(self, x, y):
         self.exit = (y, x)
@@ -337,6 +341,8 @@ class Environment:
         self.effort += self.efforts[new_state] - self.efforts[self.state]
         self.reward -= self.effort
         self.state = new_state
+        if self.state == self.exit:
+            self.done = True
 
         print()
         self.render()

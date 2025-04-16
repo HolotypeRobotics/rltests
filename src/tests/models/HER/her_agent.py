@@ -88,7 +88,7 @@ class HER_Agent():
 
             log_prob = action_dist.log_prob(action) # Store log probability for REINFORCE
             log_probs.append(log_prob)
-
+            # Todo: the previous action is always 0 in the environment. must fix.
             next_state, reward, done = self.env.step(action.item())
 
             # Store r and p for backpropagation

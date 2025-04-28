@@ -41,12 +41,15 @@ class Environment:
         else:
             raise ValueError("Invalid action")
 
-    def __init__(self, rewards, efforts, n_objects = None): # Added default dimensions and objects
+    def __init__(self, rewards=None, efforts=None, n_objects=None): # Added default dimensions and objects
         self.width = len(rewards[0])
         self.height = len(rewards)
         self.n_objects = n_objects
-        self.rewards = np.array(rewards)
-        self.efforts = np.array(efforts)
+        if rewards is not None:
+            self.rewards = np.array(rewards)
+            self.available_rewards = self.rewards
+        if efforts is not None:
+            self.efforts = np.array(efforts)
         self.objects = np.zeros((self.height, self.width), dtype=int) # Initialize with zeros
         self.state = (0, 0)
         self.previous_action = Action.MOVE_FORWARD
@@ -130,14 +133,79 @@ class Environment:
         one_hot[direction] = 1
         return one_hot
 
-    # def proximity_to_one_hot(self, distance, n_bins=3, max_distance=None):
-    #     if max_distance is None:
-    #         max_distance = np.max(self.rewards.shape) * np.sqrt(2) # Diagonal
-    #     bins = np.linspace(0, max_distance, n_bins + 1)
-    #     bin_index = np.digitize(distance, bins) - 1 # Subtract 1 to make indices 0-based
-    #     one_hot = np.zeros(n_bins)
-    #     one_hot[min(bin_index, n_bins - 1)] = 1 # Ensure index is within bounds
-    #     return one_hot
+    def load_from_file(self, filepath):
+        """
+        Load environment layout from a text file.
+        
+        File format:
+        # - Wall
+        . - Empty space
+        S - Starting position
+        E - Exit
+        1-9 - Objects (numbered)
+        """
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+        
+        # Strip whitespace and filter out empty lines
+        lines = [line.strip() for line in lines if line.strip()]
+        
+        # Determine dimensions
+        height = len(lines)
+        width = max(len(line) for line in lines)
+        
+        # Resize environment if needed
+        if height > self.height or width > self.width:
+            self.height = height
+            self.width = width
+            self.rewards = np.zeros((height, width))
+            self.efforts = np.zeros((height, width))
+            self.walls = np.zeros((height, width))
+            self.objects = np.zeros((height, width), dtype=int)
+        
+        # Parse the file
+        start_found = False
+        exit_positions = []
+        object_positions = {}
+        
+        for y, line in enumerate(lines):
+            for x, char in enumerate(line):
+                if char == '#':
+                    # Wall
+                    self.walls[y, x] = 1
+                    self.rewards[y, x] = -0.1  # Slight negative reward for walls
+                elif char == 'S':
+                    # Starting position
+                    self.set_start(x, y)
+                    start_found = True
+                elif char == 'E':
+                    # Exit
+                    exit_positions.append((x, y))
+                    self.rewards[y, x] = 10.0  # High reward for exit
+                elif char.isdigit() and char != '0':
+                    # Object
+                    obj_id = int(char)
+                    self.objects[y, x] = obj_id
+                    object_positions[obj_id] = (y, x)
+                else:
+                    # Empty space
+                    pass
+        
+        # Set exits
+        self.exits = [(y, x) for x, y in exit_positions]
+        
+        # If no start was specified, use default
+        if not start_found:
+            self.set_start(0, 0)
+        
+        # Update object positions
+        self.object_positions = self.find_object_positions()
+        self.distances = self.calculate_distances()
+        
+        # Initialize state
+        self.state = self.start
+        
+        return True
 
     def action_to_one_hot(self, action):
         one_hot = np.zeros(3)
@@ -253,9 +321,6 @@ class Environment:
 
         self.remove_projections()
 
-
-
-
     def project(self, state, direction, color):
         state = self.one_hot_to_state(state)
         self.imagined_scenes.append((direction, state, color))
@@ -334,14 +399,12 @@ class Environment:
         direction = torch.from_numpy(direction).unsqueeze(0).float()
         obj_distances = F.softmax(torch.from_numpy(self.distances).float(), dim=-1).unsqueeze(0)
         # previous action doesnt need to be converted
-        return (position, direction, obj_distances, previous_action), self.reward, self.done
+        return (position, direction, obj_distances, previous_action), self.reward, self.effort, self.done
 
     def step(self, action):
-        moved = False
+        
         self.previous_action = action
         new_state = self.state
-        self.effort = 0.0001
-        self.reward = 0
 
         if len(self.path) == 0:
             self.path.append(self.state)
@@ -366,14 +429,14 @@ class Environment:
         else:
             raise ValueError(f"Invalid action: {action}")
         
+        self.reward = self.available_rewards[new_state]
+        self.available_rewards[new_state] = 0 # Mark as visited
+        self.effort += self.efforts[new_state]
+
         # Figure out if the agent moved
         if new_state != self.state:
-            moved = True
             self.path.append(self.state)
 
-        self.reward += self.rewards[new_state] - self.rewards[self.state]
-        self.effort += self.efforts[new_state] - self.efforts[self.state]
-        self.reward -= self.effort
         self.state = new_state
 
         for exit in self.exits:

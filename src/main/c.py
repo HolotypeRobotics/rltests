@@ -64,14 +64,14 @@ class Agent(nn.Module):
         calibrated_pos_logits = pos_logits / temperature
         calibrated_head_logits = head_logits / temperature
         calibrated_obj_distance_logits = obj_distance_logits / temperature
-        
+
         action_conf = F.softmax(calibrated_action_logits, dim=-1).max(dim=-1)[0]
         pos_conf    = F.softmax(calibrated_pos_logits, dim=-1).max(dim=-1)[0]
-        head_conf   = F.softmax(calibrated_head_logits, dim=-1)[0]
-        obj_distance_conf = F.softmax(calibrated_obj_distance_logits, dim=-1)[0]
+        head_conf   = F.softmax(calibrated_head_logits, dim=-1).max(dim=-1)[0]
+        obj_distance_conf = F.softmax(calibrated_obj_distance_logits, dim=-1).max(dim=-1)[0]
+
         # Combined confidence: simple average of all three.
         confidence = (action_conf + pos_conf + head_conf + obj_distance_conf) / 4.0
-
         return action_logits, value, pos_logits, head_logits, obj_distance_logits, confidence, info_value, effort_pred
 
     def VTE(self, env, position, direction, obj_distances, top_k=2, prev_option=None, belief=None, color=None):
@@ -212,9 +212,9 @@ def train_hierarchical():
             while not low_done and not task_switch:
                 low_logits, low_value, low_pos_logits, low_dir_logits, low_obj_dist_logits, low_conf, low_voi, low_effort_pred = low_agent(position=position, direction=direction, obj_distances=obj_distances, prev_option=prev_action, belief=belief)
                 low_probs = F.softmax(low_logits, dim=-1)
-                # low_pos_logits = F.softmax(low_pos_logits, dim=-1)
-                # low_dir_logits = F.softmax(low_dir_logits, dim=-1)
-                # low_obj_dist_logits = F.sigmoid(low_obj_dist_logits)
+                low_pos_logits = F.softmax(low_pos_logits, dim=-1)
+                low_dir_logits = F.softmax(low_dir_logits, dim=-1)
+                low_obj_dist_logits = F.sigmoid(low_obj_dist_logits)
 
                 if low_conf.item() < low_agent.conf_threshold:
                     print(f"Low VTE...")
@@ -247,8 +247,9 @@ def train_hierarchical():
                 low_pos_target = torch.argmax(position, dim=-1)
                 low_dir_target = torch.argmax(direction, dim=-1)
                 low_value_target = reward + gamma * next_low_value.detach()
-                low_effort_target = effort + gamma * next_low_effort.detach()
-                
+                # low_effort_target = effort + gamma * next_low_effort.detach()
+                low_effort_target = torch.tensor(effort, dtype=torch.float32)
+
                 pos_correct = (low_pred_pos == low_pos_target).float()
                 dir_correct = (low_pred_dir == low_dir_target).float()
                 dist_correct = torch.sum(torch.sqrt(low_pred_obj_dist * obj_distances), dim=-1)
@@ -267,9 +268,10 @@ def train_hierarchical():
                 # Calculate low-level losses.
                 # policy loss
                 # Imitation loss: train policy to repeat the VTE-chosen action
-                chosen_action_idx = chosen_action.unsqueeze(0)  # shape [1]
-                input(f"chosen_action_idx: {chosen_action_idx}, logits: {low_logits}")
-                low_policy_loss = F.cross_entropy(low_logits, chosen_action_idx)
+                if low_logits.dim() == 1:
+                    low_logits = low_logits.unsqueeze(0)  # Add batch dimension [1, num_classes]
+                chosen_action = chosen_action.reshape(-1)  # Flatten to [N]
+                low_policy_loss = F.cross_entropy(low_logits, chosen_action)
 
                 low_value_loss = F.mse_loss(low_value, low_value_target)
                 low_effort_loss = F.mse_loss(low_effort_pred, low_effort_target)
@@ -312,7 +314,8 @@ def train_hierarchical():
             high_pos_target = torch.argmax(position, dim=-1)
             high_dir_target = torch.argmax(direction, dim=-1)
             high_value_target = segment_reward + gamma * next_high_value.detach()  # Include effort in value calculation
-            high_effort_target = segment_effort + gamma * next_high_effort.detach()
+            # high_effort_target = segment_effort + gamma * next_high_effort.detach()
+            high_effort_target = torch.tensor(segment_effort, dtype=torch.float32)
 
             high_pos_correct = (high_pred_pos == high_pos_target).float()
             high_dir_correct = (high_pred_dir == high_dir_target).float()
@@ -332,9 +335,10 @@ def train_hierarchical():
 
             # Calculate high-level losses.
             # policy loss
-            chosen_action_idx = chosen_action.unsqueeze(0)  # shape [1]
-            input(f"chosen_action_idx: {chosen_action_idx}, logits: {high_logits}")
-            high_policy_loss = F.cross_entropy(high_logits, chosen_action_idx)
+            if high_logits.dim() == 1:
+                high_logits = high_logits.unsqueeze(0)  # Add batch dimension [1, num_classes]
+            chosen_action = chosen_action.reshape(-1)  # Flatten to [N]
+            high_policy_loss = F.cross_entropy(high_logits, chosen_action)
 
             high_value_loss = F.mse_loss(high_value, high_value_target)
             high_effort_loss = F.mse_loss(high_effort_pred, high_effort_target)
@@ -359,7 +363,7 @@ def train_hierarchical():
 
         episode_positions.append(pos_log)
         if (episode + 1) % 100 == 0:
-            print(f"Episode {episode}, Cumulative Reward: {cumulative_reward_episode:.2f}, Final Env Pos: {env.pos}, High Conf: {high_conf.item():.3f}, Low Conf: {low_conf.item():.3f}, VTE Freq: {vte_freq} / {episode+1}")
+            print(f"Episode {episode}, Cumulative Reward: {cumulative_reward_episode:.2f}, Final Env Pos: {env.state}, High Conf: {high_conf.item():.3f}, Low Conf: {low_conf.item():.3f}, VTE Freq: {vte_freq} / {episode+1}")
 
 if __name__ == "__main__":
     train_hierarchical()

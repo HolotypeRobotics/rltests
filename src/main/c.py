@@ -19,6 +19,12 @@ class Agent(nn.Module):
         """
 
         super(Agent, self).__init__()
+        self.input_dim = input_dim
+        self.pos_pred_dim = pos_pred_dim
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+        self.head_dir_dim = head_dir_dim
+        self.obj_distance_dim = obj_distance_dim
         self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
         self.fc_actor = nn.Linear(hidden_dim, action_dim)
         self.fc_critic = nn.Linear(hidden_dim, 1)
@@ -31,6 +37,7 @@ class Agent(nn.Module):
         self.log_temperature = nn.Parameter(torch.zeros(1))
         # Set a confidence threshold for preforming VTE.
         self.conf_threshold = 0.9
+        self.sim_conf_threshold = 0.5
         print(f"obj_distance_dim: {obj_distance_dim}, pos_pred_dim: {pos_pred_dim}, head_dir_dim: {head_dir_dim}")
 
     def forward(self, position, direction, obj_distances, prev_option, belief=None):
@@ -105,7 +112,7 @@ class Agent(nn.Module):
             # Get top_k candidate action indices.
             top_options = torch.topk(probs, top_k, dim=-1).indices.squeeze(0)
             best_score = -float('inf')
-            best_action = None
+            best_action = top_options[0]
 
             # look at each action/belief individually
             for option in top_options:
@@ -115,15 +122,33 @@ class Agent(nn.Module):
                 # Form a simulated new input by concatenating the predicted next state with the candidate option, then get the value
                 # Get the predicted value and info value by plugging in the candidate action
                 # Simulate forward prediction.
-                sim_act, sim_value, sim_pos, sim_dir, sim_dist, sim_confidence, sim_info_value, sim_effort = self.forward(position=position, direction=direction, obj_distances=obj_distances, prev_option=candidate, belief=belief)
-                # TODO: try out different ways of combining the values
-                env.project(sim_pos, torch.argmax(sim_dir), color=color)
-                score = (sim_value - sim_effort + sim_info_value)  # Incorporate effort prediction into the score
-                if score > best_score:
-                    best_score = score
-                    best_action = option
+                sim_act = candidate.clone().detach()
+                sim_pos = position.clone().detach()
+                sim_dir = direction.clone().detach()
+                sim_dist = obj_distances.clone().detach()
+                sim_effort = 0
 
-                print(f"Option: {best_action}?")
+                for i in range(10):
+                    sim_act, sim_value, sim_pos, sim_dir, sim_dist, sim_confidence, sim_info_value, _effort = self.forward(position=sim_pos, direction=sim_dir, obj_distances=sim_dist, prev_option=sim_act, belief=belief)
+                    
+                    sim_act = F.softmax(sim_act, dim=-1)
+                    sim_pos = F.softmax(sim_pos, dim=-1)
+                    sim_dir = F.softmax(sim_dir, dim=-1)
+                    sim_dist = F.sigmoid(sim_dist)
+                    
+                    sim_effort += _effort
+
+                    if sim_confidence < self.sim_conf_threshold:
+                        break
+                    env.project(sim_pos, torch.argmax(sim_dir), color=color)
+                    # TODO: try out different ways of combining the values
+                    # score = (sim_value - sim_effort + sim_info_value)  # Incorporate effort prediction into the score
+                    score = (sim_value - sim_effort)  # Incorporate effort prediction into the score
+                    if score > best_score:
+                        best_score = score
+                        best_action = option
+
+                print(f"Option: {best_action}? reward: {best_score}, confidence: {sim_confidence}, effort: {sim_effort}")
                 index = torch.argmax(sim_act, dim=-1)
                 sim_pos = torch.zeros(1, env.width * env.height)
                 sim_pos[0, index] = 1.0
@@ -133,24 +158,28 @@ class Agent(nn.Module):
 def train_hierarchical():
     # Define a single sequence.
 
+    # External state: one-hot position (seq_len) + previous action (3) + head direction (2).
+    belief_dim = 2   # For high-level belief.
+    action_dim = 4   # left right forward terminate
+    head_dir_dim = 4
+    task_switch_action = action_dim - 1
+
     n_objects = 3
-    env = Environment(rewards=[[0, 0.1, 0.1, 0.2, 0.3, .4, 3], [3, 0.1, 0.1, 0.2, 0.3, .2, 1]],
-                    efforts=[[.1, .1, 0.1, 0.1, .1, .4, .5],[0.0, .3, 0.4, 0.1, .1, .1, .1]],
+    env = Environment(n_actions=action_dim, rewards=[[3, 0.5, 0.3, 0.0, 0.3, 0.5, 3]],
+                                            efforts=[[.5, 0.2, 0.1, 0.1, 0.1, 0.2, 0.5]],
                     n_objects=3)
     # env.set_start(0,0)
     env.set_start((env.width//2), (env.height//2)) # Start in the middle of the grid.
     env.add_exit(0, 0)
     env.add_exit(env.width-1, env.height-1) # Bottom right corner.
-    env.add_exit(0, env.height-1) # Bottom left corner.
+
+    # env.add_exit(0, env.height-1) # Bottom left corner.
+    # env.add_exit(env.width-1, 0) # Top right corner.
     pos_dim = env.width * env.height
 
-    # env = Environment()
-    # env.load_from_file("environment.txt")
-
-    # External state: one-hot position (seq_len) + previous action (3) + head direction (2).
-    belief_dim = 5   # For high-level belief.
-    action_dim = 3   # left right forward
-    head_dir_dim = 4
+    print(f"Environment size: {env.width} x {env.height}, Total positions: {pos_dim}, Number of objects: {n_objects}")
+    print(f"Start position: {env.start}, Exit positions: {env.exits}")
+    input("Press Enter to continue...")
 
     # High-level agent: input is external state concatenated with belief.
     high_input_dim = pos_dim + head_dir_dim + n_objects + belief_dim
@@ -159,7 +188,7 @@ def train_hierarchical():
     low_agent = Agent(input_dim=low_input_dim, pos_pred_dim=pos_dim, hidden_dim=128, obj_distance_dim=n_objects, action_dim=action_dim, head_dir_dim=head_dir_dim)
 
     high_optimizer = optim.Adam(high_agent.parameters(), lr=.01)
-    low_optimizer = optim.Adam(low_agent.parameters(), lr=.01)
+    low_optimizer = optim.Adam(low_agent.parameters(), lr=.001)
 
     num_episodes = 1000
     gamma = 0.99
@@ -168,6 +197,7 @@ def train_hierarchical():
     policy_loss_weight = 0.45
     error_threshold = 1.0  # threshold for triggering a task switch
     episode_positions = []
+
     # Define two fixed head directions for training both forward and reverse predictions.
     for episode in range(num_episodes):
         (position, direction, obj_distances, prev_action), _, _, _ = env.reset()
@@ -188,14 +218,14 @@ def train_hierarchical():
             high_dir_logits = F.softmax(high_dir_logits, dim=-1)
             high_obj_dist_logits = F.sigmoid(high_obj_dist_logits)
 
-            
-            # Use VTE only if high_conf is low.
+            # Use VTE if high_conf is low, or triggered by VTE action.
             if high_conf.item() < high_agent.conf_threshold:
                 print(f"High VTE...")
                 chosen_high_action = high_agent.VTE(env=env, position=position, direction=direction, obj_distances=obj_distances, prev_option=belief, top_k=2, belief=None, color=2)
                 vte_freq += 1
             else:
                 chosen_high_action = torch.argmax(high_logits)
+
             # Convert chosen high-level action to one-hot belief.
             new_belief = torch.zeros_like(high_logits)
             new_belief[0, chosen_high_action] = 1.0
@@ -203,13 +233,11 @@ def train_hierarchical():
 
             segment_reward = 0.0
             segment_effort = 0.0
-
-            task_switch = False
-            low_done = False
             prev_low_conf = None
+            task_switch = False
 
             # ----- Low-Level Nested Loop -----
-            while not low_done and not task_switch:
+            while not task_switch and not episode_done:
                 low_logits, low_value, low_pos_logits, low_dir_logits, low_obj_dist_logits, low_conf, low_voi, low_effort_pred = low_agent(position=position, direction=direction, obj_distances=obj_distances, prev_option=prev_action, belief=belief)
                 low_probs = F.softmax(low_logits, dim=-1)
                 low_pos_logits = F.softmax(low_pos_logits, dim=-1)
@@ -222,6 +250,12 @@ def train_hierarchical():
                     vte_freq += 1
                 else:
                     chosen_action = torch.distributions.Categorical(low_probs).sample()
+
+                if chosen_action == task_switch_action:
+                    # Termination action.
+                    print(f"Termination action chosen.")
+                    task_switch = True
+
                 print(f"Belief: {belief}, High conf: {high_conf.item():.3f}, Low Conf: {low_conf.item():.3f},")
 
                 (position, direction, obj_distances, prev_action), reward, effort, env_terminate = env.step(chosen_action.item())
@@ -246,9 +280,11 @@ def train_hierarchical():
 
                 low_pos_target = torch.argmax(position, dim=-1)
                 low_dir_target = torch.argmax(direction, dim=-1)
-                low_value_target = reward + gamma * next_low_value.detach()
+                low_value_target = (reward + gamma * next_low_value.detach()).unsqueeze(0)
+                print(f"Low value target: {low_value_target.item():.3f}, Low value: {low_value.item():.3f}, reward: {reward:.3f}, next_low_value: {next_low_value.item():.3f}")
+
                 # low_effort_target = effort + gamma * next_low_effort.detach()
-                low_effort_target = torch.tensor(effort, dtype=torch.float32)
+                low_effort_target = torch.tensor(effort, dtype=torch.float32).unsqueeze(0)
 
                 pos_correct = (low_pred_pos == low_pos_target).float()
                 dir_correct = (low_pred_dir == low_dir_target).float()
@@ -272,9 +308,9 @@ def train_hierarchical():
                     low_logits = low_logits.unsqueeze(0)  # Add batch dimension [1, num_classes]
                 chosen_action = chosen_action.reshape(-1)  # Flatten to [N]
                 low_policy_loss = F.cross_entropy(low_logits, chosen_action)
-
                 low_value_loss = F.mse_loss(low_value, low_value_target)
                 low_effort_loss = F.mse_loss(low_effort_pred, low_effort_target)
+
                 low_pos_loss = F.cross_entropy(low_pos_logits, position)
                 low_dir_loss = F.cross_entropy(low_dir_logits, direction)
                 low_obj_dist_loss = F.cross_entropy(low_obj_dist_logits, obj_distances)
@@ -294,8 +330,8 @@ def train_hierarchical():
 
                 if low_pos_loss.item() > error_threshold and low_conf.item() > high_conf.item():
                     task_switch = True
+                    chosen_action = torch.tensor(task_switch_action)
                 if env_terminate:
-                    low_done = True
                     episode_done = True
 
             # ----- High-Level Update (per segment) -----
@@ -313,9 +349,15 @@ def train_hierarchical():
 
             high_pos_target = torch.argmax(position, dim=-1)
             high_dir_target = torch.argmax(direction, dim=-1)
-            high_value_target = segment_reward + gamma * next_high_value.detach()  # Include effort in value calculation
+            # This avoids infinitely growing value estimate
+            if episode_done:
+                high_value_target = torch.tensor([segment_reward], dtype=torch.float32)
+            else:
+                high_value_target = segment_reward + gamma * next_high_value.detach()  # Include effort in value calculation
+            print(f"High value target: {high_value_target.item():.3f}, High value: {high_value.item():.3f}, reward: {segment_reward:.3f}, next_high_value: {next_high_value.item():.3f}")
+            # input()
             # high_effort_target = segment_effort + gamma * next_high_effort.detach()
-            high_effort_target = torch.tensor(segment_effort, dtype=torch.float32)
+            high_effort_target = torch.tensor(segment_effort, dtype=torch.float32).unsqueeze(0)
 
             high_pos_correct = (high_pred_pos == high_pos_target).float()
             high_dir_correct = (high_pred_dir == high_dir_target).float()
@@ -335,10 +377,7 @@ def train_hierarchical():
 
             # Calculate high-level losses.
             # policy loss
-            if high_logits.dim() == 1:
-                high_logits = high_logits.unsqueeze(0)  # Add batch dimension [1, num_classes]
-            chosen_action = chosen_action.reshape(-1)  # Flatten to [N]
-            high_policy_loss = F.cross_entropy(high_logits, chosen_action)
+            high_policy_loss = F.cross_entropy(high_logits, belief)
 
             high_value_loss = F.mse_loss(high_value, high_value_target)
             high_effort_loss = F.mse_loss(high_effort_pred, high_effort_target)
@@ -364,6 +403,34 @@ def train_hierarchical():
         episode_positions.append(pos_log)
         if (episode + 1) % 100 == 0:
             print(f"Episode {episode}, Cumulative Reward: {cumulative_reward_episode:.2f}, Final Env Pos: {env.state}, High Conf: {high_conf.item():.3f}, Low Conf: {low_conf.item():.3f}, VTE Freq: {vte_freq} / {episode+1}")
+
+
+    # Test the trained agent
+    # First test each beief in isolation, only using the low level agent.
+    for i in range(belief_dim):
+        belief = torch.zeros(1, belief_dim)
+        (position, direction, obj_distances, prev_action), _, _, _ = env.reset()
+        belief[0, i] = 1.0
+        print(f"Testing belief: {belief}")
+        chosen_low_action = None
+        steps = 0
+        done = False
+
+        while chosen_low_action != task_switch_action and not done:
+            steps += 1
+            if steps > 1000:
+                break
+            low_logits, _, _, _, _, _, _, _ = low_agent(position=position, direction=direction, obj_distances=obj_distances, prev_option=prev_action, belief=belief)
+            low_probs = F.softmax(low_logits, dim=-1)
+            chosen_low_action = torch.argmax(low_probs)
+            (position, direction, obj_distances, prev_action), reward, effort, done = env.step(chosen_low_action.item())
+            env.render()
+            input()
+            print(f"Step {steps}, Chosen Action: {chosen_low_action.item()}, Position: {env.state}")
+
+        print(f"Reached termination state after {steps} steps.")
+        input()
+
 
 if __name__ == "__main__":
     train_hierarchical()

@@ -41,19 +41,20 @@ class Environment:
         else:
             raise ValueError("Invalid action")
 
-    def __init__(self, rewards=None, efforts=None, n_objects=None): # Added default dimensions and objects
+    def __init__(self, n_actions, rewards=None, efforts=None, n_objects=None): # Added default dimensions and objects
         self.width = len(rewards[0])
         self.height = len(rewards)
         self.n_objects = n_objects
+        self.n_actions = n_actions
         if rewards is not None:
             self.rewards = np.array(rewards)
-            self.available_rewards = self.rewards
+            self.available_rewards = self.rewards.copy()
         if efforts is not None:
             self.efforts = np.array(efforts)
         self.objects = np.zeros((self.height, self.width), dtype=int) # Initialize with zeros
         self.state = (0, 0)
         self.previous_action = Action.MOVE_FORWARD
-        self.direction = Direction.EAST
+        self.direction = Direction.SOUTH
         self.start = (0, 0)
         self.exits = []
         self.place_objects() # Place objects randomly
@@ -125,7 +126,6 @@ class Environment:
         index = np.argmax(one_hot)
         y = index // self.width
         x = index % self.width
-        print(f"Index: {index}, Y: {y}, X: {x}")
         return (y, x)
 
     def direction_to_one_hot(self, direction):
@@ -208,14 +208,16 @@ class Environment:
         return True
 
     def action_to_one_hot(self, action):
-        one_hot = np.zeros(3)
+        one_hot = np.zeros(self.n_actions)
         one_hot[action] = 1
         return one_hot
 
     def reset(self):
+        print("Resetting environment...")
         self.state = self.start
         self.direction = Direction.EAST
         self.reward = 0  # No reward on reset
+        self.available_rewards = self.rewards.copy()
         self.effort = 0
         self.done = False
         self.path = []
@@ -231,6 +233,10 @@ class Environment:
         self.start = (y, x)
 
     def add_exit(self, x, y):
+        if y >= self.rewards.shape[0]:
+            raise ValueError("Y coordinate exceeds grid height.")
+        if x >= self.rewards.shape[1]:
+            raise ValueError("X coordinate exceeds grid width.")
         self.exits.append((y, x))
 
     def find_object_positions(self):
@@ -398,8 +404,13 @@ class Environment:
         position = torch.from_numpy(position).unsqueeze(0).float()
         direction = torch.from_numpy(direction).unsqueeze(0).float()
         obj_distances = F.softmax(torch.from_numpy(self.distances).float(), dim=-1).unsqueeze(0)
+        reward = self.reward
+        effort = self.effort
+        # reset
+        self.reward = 0
+        self.effort = 0
         # previous action doesnt need to be converted
-        return (position, direction, obj_distances, previous_action), self.reward, self.effort, self.done
+        return (position, direction, obj_distances, previous_action), reward, effort, self.done
 
     def step(self, action):
         
@@ -416,7 +427,6 @@ class Environment:
             self.direction = (self.direction + 1) % 4
             self.effort += 0.0012
         elif action == Action.MOVE_FORWARD:
-            self.effort += 0.001
 
             if self.direction == Direction.NORTH:
                 new_state = (max(self.state[0] - 1, 0), self.state[1])
@@ -426,12 +436,11 @@ class Environment:
                 new_state = (self.state[0], max(self.state[1] - 1, 0))
             elif self.direction == Direction.EAST:
                 new_state = (self.state[0], min(self.state[1] + 1, self.rewards.shape[1] - 1))
-        else:
-            raise ValueError(f"Invalid action: {action}")
         
         self.reward = self.available_rewards[new_state]
+        print(f"Reward: {self.reward}")
         self.available_rewards[new_state] = 0 # Mark as visited
-        self.effort += self.efforts[new_state]
+        self.effort = self.efforts[new_state]
 
         # Figure out if the agent moved
         if new_state != self.state:
